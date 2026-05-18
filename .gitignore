@@ -1,0 +1,26 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+.env.*
+
+# Generated document outputs
+converted/
+translated/
+work/
+unzipped_docx/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Logs
+*.log
