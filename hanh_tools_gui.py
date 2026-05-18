@@ -44,6 +44,7 @@ class HanhToolsApp:
         self.include_extras_var = tk.BooleanVar(value=False)
         self.batch_size_var = tk.StringVar(value="20")
         self.max_tokens_var = tk.StringVar(value="8192")
+        self.concurrency_var = tk.StringVar(value="3")
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)
         self.save_env_var = tk.BooleanVar(value=True)
@@ -92,6 +93,8 @@ class HanhToolsApp:
         ttk.Entry(opts, textvariable=self.batch_size_var, width=4).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(opts, text="Max output tokens:").pack(side=tk.LEFT)
         ttk.Entry(opts, textvariable=self.max_tokens_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(opts, text="Luồng song song:").pack(side=tk.LEFT)
+        ttk.Entry(opts, textvariable=self.concurrency_var, width=3).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Checkbutton(opts, text="Lưu key vào .env", variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(opts, text="Dịch cả header/footer/footnote/comment",
                         variable=self.include_extras_var).pack(side=tk.LEFT, padx=(0, 12))
@@ -176,8 +179,9 @@ class HanhToolsApp:
         try:
             batch_size = max(1, int(self.batch_size_var.get().strip()))
             max_tokens = max(512, int(self.max_tokens_var.get().strip()))
+            concurrency = max(1, min(10, int(self.concurrency_var.get().strip())))
         except ValueError:
-            messagebox.showwarning(APP_TITLE, "Batch size và Max output tokens phải là số nguyên.")
+            messagebox.showwarning(APP_TITLE, "Batch size, Max tokens và Luồng phải là số nguyên.")
             return
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
@@ -188,7 +192,7 @@ class HanhToolsApp:
             target=self._run_pipeline,
             args=(input_path, output_path, self.target_lang_var.get().strip() or "Vietnamese",
                   self.model_var.get().strip() or "gpt-4.1-nano", dry_run,
-                  self.include_extras_var.get(), batch_size, max_tokens),
+                  self.include_extras_var.get(), batch_size, max_tokens, concurrency),
             daemon=True,
         )
         self._worker.start()
@@ -212,7 +216,8 @@ class HanhToolsApp:
         env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str,
-                      dry_run: bool, include_extras: bool, batch_size: int, max_tokens: int) -> None:
+                      dry_run: bool, include_extras: bool, batch_size: int, max_tokens: int,
+                      concurrency: int) -> None:
         stream = _StreamToQueue(self._log_queue)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = stream
@@ -230,7 +235,7 @@ class HanhToolsApp:
             print(f"Input: {in_p}")
             print(f"Output: {out_p}")
             print(f"Target language: {target_lang} | Model: {model} | Dry-run: {dry_run}")
-            print(f"Batch size: {batch_size} | Max output tokens: {max_tokens} | Include extras: {include_extras}")
+            print(f"Batch size: {batch_size} | Max output tokens: {max_tokens} | Concurrency: {concurrency} | Include extras: {include_extras}")
 
             docx_path = self._prepare_docx(in_p, converted_dir)
 
@@ -255,6 +260,7 @@ class HanhToolsApp:
                 batch_size=batch_size, retries=2, verbose=True, min_batch_size=1,
                 cancel_check=self._cancel_event.is_set,
                 include_extras=include_extras,
+                concurrency=concurrency,
             )
             final_docx = zip_docx(work_dir, out_p, verbose=True)
 
@@ -266,6 +272,7 @@ class HanhToolsApp:
             print(f"- Paragraphs translated: {stats.paragraphs_translated}")
             print(f"- Paragraphs skipped: {stats.paragraphs_skipped}")
             print(f"- Paragraphs failed: {stats.paragraphs_failed}")
+            print(f"- Paragraphs via fallback (text → slot 0): {stats.paragraphs_fallback}")
         except CancelledError:
             print("\n>>> Đã dừng theo yêu cầu. File output có thể chưa hoàn chỉnh.")
         except Exception as e:

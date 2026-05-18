@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -72,6 +73,7 @@ class TranslationStats:
     paragraphs_translated: int = 0
     paragraphs_skipped: int = 0
     paragraphs_failed: int = 0
+    paragraphs_fallback: int = 0  # marker fail, dùng fallback distribute vào slot 0
 
 
 @dataclass
@@ -102,6 +104,7 @@ def translate_docx_xml_folder(
     min_batch_size: int = 1,
     cancel_check: Callable[[], bool] = _noop_cancel,
     include_extras: bool = False,
+    concurrency: int = 1,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
@@ -121,11 +124,13 @@ def translate_docx_xml_folder(
             verbose=verbose,
             min_batch_size=min_batch_size,
             cancel_check=cancel_check,
+            concurrency=concurrency,
         )
         stats.paragraphs_found += file_stats.paragraphs_found
         stats.paragraphs_translated += file_stats.paragraphs_translated
         stats.paragraphs_skipped += file_stats.paragraphs_skipped
         stats.paragraphs_failed += file_stats.paragraphs_failed
+        stats.paragraphs_fallback += file_stats.paragraphs_fallback
 
     return stats
 
@@ -140,6 +145,7 @@ def _translate_xml_file(
     verbose: bool,
     min_batch_size: int,
     cancel_check: Callable[[], bool] = _noop_cancel,
+    concurrency: int = 1,
 ) -> TranslationStats:
     parser = etree.XMLParser(remove_blank_text=False, recover=False)
     tree = etree.parse(str(xml_path), parser)
@@ -180,23 +186,21 @@ def _translate_xml_file(
 
     changed = False
     batches = _chunks(dedup_units, batch_size)
-    for batch_index, batch in enumerate(batches, start=1):
-        if cancel_check():
-            if changed:
-                if verbose:
-                    print(f"Cancelled; writing partial translation: {xml_path.relative_to(root)}", flush=True)
-                tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True, standalone=None)
-            raise CancelledError("Đã dừng bởi người dùng")
-        if verbose:
-            char_count = sum(len(unit.text) for unit in batch)
-            marker_count = sum(len(unit.slots) for unit in batch)
-            print(
-                f"Translating {xml_path.relative_to(root)} "
-                f"batch {batch_index}/{len(batches)} "
-                f"({len(batch)} paragraphs, {char_count} chars, {marker_count} markers)",
-                flush=True,
-            )
-        translations = _translate_units_with_split_retry(
+
+    def _log_batch_start(batch_index: int, batch: list[ParagraphUnit]) -> None:
+        if not verbose:
+            return
+        char_count = sum(len(unit.text) for unit in batch)
+        marker_count = sum(len(unit.slots) for unit in batch)
+        print(
+            f"Translating {xml_path.relative_to(root)} "
+            f"batch {batch_index}/{len(batches)} "
+            f"({len(batch)} paragraphs, {char_count} chars, {marker_count} markers)",
+            flush=True,
+        )
+
+    def _do_batch(batch: list[ParagraphUnit], batch_index: int) -> dict[str, tuple[str, bool]]:
+        return _translate_units_with_split_retry(
             batch,
             translator=translator,
             retries=retries,
@@ -204,17 +208,58 @@ def _translate_xml_file(
             verbose=verbose,
             label=f"{xml_path.relative_to(root)} batch {batch_index}",
         )
-        # Mỗi unique unit fail = mọi paragraph dùng text đó fail.
+
+    def _apply_batch(batch: list[ParagraphUnit], translations: dict[str, tuple[str, bool]]) -> None:
+        nonlocal changed
         for rep_unit in batch:
             group = duplicate_groups[rep_unit.id]
-            translated = translations.get(rep_unit.id)
-            if not translated:
+            result = translations.get(rep_unit.id)
+            if not result:
                 stats.paragraphs_failed += len(group)
                 continue
+            translated, used_fallback = result
             for unit in group:
                 _apply_translation(unit, translated, verbose=verbose)
                 stats.paragraphs_translated += 1
+                if used_fallback:
+                    stats.paragraphs_fallback += 1
             changed = True
+
+    def _check_cancel() -> None:
+        if cancel_check():
+            if changed:
+                if verbose:
+                    print(f"Cancelled; writing partial translation: {xml_path.relative_to(root)}", flush=True)
+                tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True, standalone=None)
+            raise CancelledError("Đã dừng bởi người dùng")
+
+    if concurrency <= 1:
+        for batch_index, batch in enumerate(batches, start=1):
+            _check_cancel()
+            _log_batch_start(batch_index, batch)
+            translations = _do_batch(batch, batch_index)
+            _apply_batch(batch, translations)
+    else:
+        # Song song: worker chỉ gọi API; main thread sequential apply vào tree
+        # (lxml không thread-safe khi ghi).
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            future_map: dict = {}
+            for batch_index, batch in enumerate(batches, start=1):
+                if cancel_check():
+                    break
+                _log_batch_start(batch_index, batch)
+                future_map[pool.submit(_do_batch, batch, batch_index)] = (batch_index, batch)
+            try:
+                for fut in as_completed(future_map):
+                    batch_index, batch = future_map[fut]
+                    translations = fut.result()
+                    _apply_batch(batch, translations)
+                    _check_cancel()
+            except CancelledError:
+                # Huỷ các future chưa chạy; future đang chạy không huỷ được, đành đợi.
+                for f in future_map:
+                    f.cancel()
+                raise
 
     if changed:
         if verbose:
@@ -237,7 +282,7 @@ def _translate_units_with_split_retry(
     min_batch_size: int,
     verbose: bool,
     label: str,
-) -> dict[str, str]:
+) -> dict[str, tuple[str, bool]]:
     if not units:
         return {}
 
@@ -308,6 +353,22 @@ def _translate_units_with_split_retry(
         return left | right
 
 
+def _strip_markers(text: str) -> str:
+    """Bỏ tất cả marker, trả về plain text."""
+    return re.sub(r"〈/?\d+〉", "", text)
+
+
+def _fallback_to_slot_zero(translated_raw: str, expected_count: int) -> str | None:
+    """Khi model phá vỡ cấu trúc marker, gom hết text dịch vào slot 0, slot khác trống.
+    Mất chi tiết format từng slot nhưng giữ được nội dung dịch."""
+    plain = _strip_markers(translated_raw).strip()
+    if not plain:
+        return None
+    parts = [f"〈0〉{plain}〈/0〉"]
+    parts.extend(f"〈{i}〉〈/{i}〉" for i in range(1, expected_count))
+    return "".join(parts)
+
+
 def _translate_units_with_marker_retry(
     units: list[ParagraphUnit],
     *,
@@ -315,9 +376,11 @@ def _translate_units_with_marker_retry(
     retries: int,
     verbose: bool,
     label: str,
-) -> dict[str, str]:
+) -> dict[str, tuple[str, bool]]:
     pending = units
-    translations: dict[str, str] = {}
+    # value = (translated_text, used_fallback)
+    translations: dict[str, tuple[str, bool]] = {}
+    last_raw: dict[str, str] = {}
     for attempt in range(retries + 1):
         if verbose and attempt > 0:
             print(
@@ -337,6 +400,7 @@ def _translate_units_with_marker_retry(
                 if repaired != translated and verbose:
                     print(f"  [REPAIRED markers] {unit.id}", flush=True)
                 translated = repaired
+                last_raw[unit.id] = translated
             if translated is None:
                 failed.append(unit)
                 if verbose:
@@ -348,7 +412,7 @@ def _translate_units_with_marker_retry(
                 continue
             reason = _validate_markers(translated, len(unit.slots))
             if reason is None:
-                translations[unit.id] = translated
+                translations[unit.id] = (translated, False)
             else:
                 failed.append(unit)
                 if verbose:
@@ -362,12 +426,33 @@ def _translate_units_with_marker_retry(
         if not failed:
             break
         pending = failed
-        if attempt == retries and verbose:
-            print(
-                f"Skipped {len(failed)} paragraphs after {retries + 1} attempts: "
-                f"{', '.join(unit.id for unit in failed)}",
-                flush=True,
-            )
+        if attempt == retries:
+            # Hết retry — thử fallback distribute cho từng unit còn fail.
+            recovered: list[str] = []
+            still_failed: list[str] = []
+            for unit in failed:
+                raw = last_raw.get(unit.id)
+                if raw is None:
+                    still_failed.append(unit.id)
+                    continue
+                fb = _fallback_to_slot_zero(raw, len(unit.slots))
+                if fb is not None:
+                    translations[unit.id] = (fb, True)
+                    recovered.append(unit.id)
+                else:
+                    still_failed.append(unit.id)
+            if verbose and recovered:
+                print(
+                    f"Fallback distribute (text → slot 0) for {len(recovered)} paragraphs: "
+                    f"{', '.join(recovered)}",
+                    flush=True,
+                )
+            if verbose and still_failed:
+                print(
+                    f"Skipped {len(still_failed)} paragraphs after {retries + 1} attempts: "
+                    f"{', '.join(still_failed)}",
+                    flush=True,
+                )
 
     return translations
 

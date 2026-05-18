@@ -50,6 +50,7 @@ def main() -> None:
         verbose=args.verbose,
         min_batch_size=args.min_batch_size,
         include_extras=args.include_extras,
+        concurrency=args.concurrency,
     )
     final_docx = zip_docx(work_dir, output_path, verbose=args.verbose)
 
@@ -61,6 +62,7 @@ def main() -> None:
     print(f"- Paragraphs translated: {stats.paragraphs_translated}")
     print(f"- Paragraphs skipped: {stats.paragraphs_skipped}")
     print(f"- Paragraphs failed: {stats.paragraphs_failed}")
+    print(f"- Paragraphs via fallback (text → slot 0): {stats.paragraphs_fallback}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,6 +84,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--dry-run-prefix", default="")
+    parser.add_argument("--concurrency", type=int, default=3,
+                        help="Số luồng song song gọi API (1 = sequential).")
     parser.add_argument(
         "--include-extras",
         action="store_true",
