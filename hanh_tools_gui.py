@@ -41,6 +41,15 @@ class HanhToolsApp:
         self.target_lang_var = tk.StringVar(value="Vietnamese")
         self.model_var = tk.StringVar(value="gpt-4.1-nano")
         self.dry_run_var = tk.BooleanVar(value=False)
+        self.api_key_var = tk.StringVar()
+        self.show_key_var = tk.BooleanVar(value=False)
+        self.save_env_var = tk.BooleanVar(value=True)
+
+        # Tự load API key từ .env hoặc biến môi trường nếu có
+        load_dotenv()
+        existing_key = os.environ.get("OPENAI_API_KEY", "")
+        if existing_key:
+            self.api_key_var.set(existing_key)
 
         self._log_queue: "queue.Queue[str]" = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -61,26 +70,38 @@ class HanhToolsApp:
         ttk.Entry(frm, textvariable=self.output_var, width=70).grid(row=1, column=1, sticky="we", **pad)
         ttk.Button(frm, text="Chọn...", command=self._pick_output).grid(row=1, column=2, **pad)
 
+        ttk.Label(frm, text="OPENAI_API_KEY:").grid(row=2, column=0, sticky="w", **pad)
+        self.api_key_entry = ttk.Entry(frm, textvariable=self.api_key_var, width=70, show="*")
+        self.api_key_entry.grid(row=2, column=1, sticky="we", **pad)
+        key_btns = ttk.Frame(frm)
+        key_btns.grid(row=2, column=2, **pad)
+        ttk.Checkbutton(key_btns, text="Hiện", variable=self.show_key_var,
+                        command=self._toggle_key_visibility).pack(side=tk.LEFT)
+
         opts = ttk.Frame(frm)
-        opts.grid(row=2, column=0, columnspan=3, sticky="we", **pad)
+        opts.grid(row=3, column=0, columnspan=3, sticky="we", **pad)
         ttk.Label(opts, text="Ngôn ngữ đích:").pack(side=tk.LEFT)
         ttk.Entry(opts, textvariable=self.target_lang_var, width=18).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(opts, text="Model:").pack(side=tk.LEFT)
         ttk.Entry(opts, textvariable=self.model_var, width=20).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Checkbutton(opts, text="Lưu key vào .env", variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(opts, text="Dry run (không gọi API)", variable=self.dry_run_var).pack(side=tk.LEFT)
 
         self.run_btn = ttk.Button(frm, text="Bắt đầu dịch", command=self._on_run)
-        self.run_btn.grid(row=3, column=0, columnspan=3, **pad)
+        self.run_btn.grid(row=4, column=0, columnspan=3, **pad)
 
-        ttk.Label(frm, text="Log:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Log:").grid(row=5, column=0, sticky="w", **pad)
         self.log_text = tk.Text(frm, height=18, wrap="word", state="disabled")
-        self.log_text.grid(row=5, column=0, columnspan=3, sticky="nsew", **pad)
+        self.log_text.grid(row=6, column=0, columnspan=3, sticky="nsew", **pad)
         sb = ttk.Scrollbar(frm, orient="vertical", command=self.log_text.yview)
-        sb.grid(row=5, column=3, sticky="ns")
+        sb.grid(row=6, column=3, sticky="ns")
         self.log_text.configure(yscrollcommand=sb.set)
 
         frm.columnconfigure(1, weight=1)
-        frm.rowconfigure(5, weight=1)
+        frm.rowconfigure(6, weight=1)
+
+    def _toggle_key_visibility(self) -> None:
+        self.api_key_entry.config(show="" if self.show_key_var.get() else "*")
 
     def _pick_input(self) -> None:
         path = filedialog.askopenfilename(
@@ -131,13 +152,34 @@ class HanhToolsApp:
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
 
+        api_key = self.api_key_var.get().strip()
+        dry_run = self.dry_run_var.get()
+        if not dry_run and not api_key:
+            messagebox.showwarning(APP_TITLE, "Vui lòng nhập OPENAI_API_KEY (hoặc bật Dry run).")
+            return
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+            if self.save_env_var.get():
+                self._save_env_file(api_key)
+
         self._worker = threading.Thread(
             target=self._run_pipeline,
             args=(input_path, output_path, self.target_lang_var.get().strip() or "Vietnamese",
-                  self.model_var.get().strip() or "gpt-4.1-nano", self.dry_run_var.get()),
+                  self.model_var.get().strip() or "gpt-4.1-nano", dry_run),
             daemon=True,
         )
         self._worker.start()
+
+    def _save_env_file(self, api_key: str) -> None:
+        env_path = Path(os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                        else os.path.dirname(os.path.abspath(__file__))) / ".env"
+        lines: list[str] = []
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if not line.startswith("OPENAI_API_KEY="):
+                    lines.append(line)
+        lines.append(f"OPENAI_API_KEY={api_key}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str, dry_run: bool) -> None:
         stream = _StreamToQueue(self._log_queue)
