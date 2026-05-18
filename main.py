@@ -68,6 +68,7 @@ def main() -> None:
         cache=cache,
         target_language=args.target_language,
         input_token_budget=args.input_token_budget,
+        force_font=args.force_font or None,
     )
     cache.save()
     final_docx = zip_docx(work_dir, output_path, verbose=args.verbose)
@@ -92,9 +93,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="translated/10.vi.docx")
     parser.add_argument("--converted-dir", default="converted")
     parser.add_argument("--work-dir", default="work/unzipped_docx")
-    parser.add_argument("--model", default="gpt-5-nano")
+    parser.add_argument("--model", default="gpt-4.1-nano")
     parser.add_argument("--fallback-models", nargs="*", default=["gpt-4.1-mini"],
                         help="Danh sách model dùng khi primary fail marker.")
+    parser.add_argument("--force-font", default="Times New Roman",
+                        help="Ép font cho text dịch. Rỗng = giữ font gốc.")
     parser.add_argument("--input-token-budget", type=int, default=2000,
                         help="Ngân sách input tokens cho mỗi batch (token-aware packing).")
     parser.add_argument("--no-cache", action="store_true", help="Không dùng cache persistent.")

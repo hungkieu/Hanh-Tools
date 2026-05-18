@@ -53,6 +53,37 @@ def _repair_markers(text: str) -> str:
     text = _MARKER_REPAIR_OPEN_RE.sub(lambda m: f"〈{m.group(1)}〉", text)
     text = _MARKER_REPAIR_CLOSE_ASCII_RE.sub(lambda m: f"〈/{m.group(1)}〉", text)
     text = _MARKER_REPAIR_OPEN_ASCII_RE.sub(lambda m: f"〈{m.group(1)}〉", text)
+    text = _repair_missing_close(text)
+    return text
+
+
+_ANY_MARKER_RE = re.compile(r"〈(/?)(\d+)〉")
+
+
+def _repair_missing_close(text: str) -> str:
+    """Nếu marker cuối cùng trong text là OPEN (model quên đóng), tự append close.
+
+    Chỉ áp dụng khi đúng 1 close bị thiếu và open chưa đóng đó nằm ở vị trí cuối —
+    tránh trường hợp thiếu close ở giữa (có thể hỏng thêm).
+    """
+    markers = list(_ANY_MARKER_RE.finditer(text))
+    if not markers:
+        return text
+    last = markers[-1]
+    if last.group(1) == "/":  # marker cuối là close → không phải case này
+        return text
+    open_ids = [int(m.group(2)) for m in markers if not m.group(1)]
+    close_ids = [int(m.group(2)) for m in markers if m.group(1)]
+    if len(open_ids) - len(close_ids) != 1:
+        return text
+    open_count: dict[int, int] = {}
+    for i in open_ids:
+        open_count[i] = open_count.get(i, 0) + 1
+    for i in close_ids:
+        open_count[i] = open_count.get(i, 0) - 1
+    missing = [i for i, c in open_count.items() if c > 0]
+    if len(missing) == 1 and open_count[missing[0]] == 1 and missing[0] == int(last.group(2)):
+        return text + f"〈/{missing[0]}〉"
     return text
 
 
@@ -112,6 +143,7 @@ def translate_docx_xml_folder(
     cache: TranslationCache | None = None,
     target_language: str = "Vietnamese",
     input_token_budget: int = 2000,
+    force_font: str | None = None,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
@@ -136,6 +168,7 @@ def translate_docx_xml_folder(
             cache=cache,
             target_language=target_language,
             input_token_budget=input_token_budget,
+            force_font=force_font,
         )
         stats.paragraphs_found += file_stats.paragraphs_found
         stats.paragraphs_translated += file_stats.paragraphs_translated
@@ -163,6 +196,7 @@ def _translate_xml_file(
     cache: TranslationCache | None = None,
     target_language: str = "Vietnamese",
     input_token_budget: int = 2000,
+    force_font: str | None = None,
 ) -> TranslationStats:
     parser = etree.XMLParser(remove_blank_text=False, recover=False)
     tree = etree.parse(str(xml_path), parser)
@@ -213,7 +247,7 @@ def _translate_xml_file(
                 cache_hits_units.append(unit)
                 # Apply ngay
                 for u in duplicate_groups[unit.id]:
-                    _apply_translation(u, cached, verbose=False)
+                    _apply_translation(u, cached, verbose=False, force_font=force_font)
                     stats.paragraphs_translated += 1
                 stats.cache_hits += 1
                 changed = True
@@ -269,7 +303,7 @@ def _translate_xml_file(
                 continue
             translated, used_fallback = result
             for unit in group:
-                _apply_translation(unit, translated, verbose=verbose)
+                _apply_translation(unit, translated, verbose=verbose, force_font=force_font)
                 stats.paragraphs_translated += 1
                 if used_fallback:
                     stats.paragraphs_fallback += 1
@@ -737,7 +771,10 @@ def _truncate(text: str, limit: int = 200) -> str:
     return text[:limit] + f"... (+{len(text) - limit} chars)"
 
 
-def _apply_translation(unit: ParagraphUnit, translated: str, *, verbose: bool = False) -> None:
+def _apply_translation(
+    unit: ParagraphUnit, translated: str,
+    *, verbose: bool = False, force_font: str | None = None,
+) -> None:
     matches = list(MARKER_RE.finditer(translated))
     for slot, match in zip(unit.slots, matches, strict=True):
         raw = match.group(2)
@@ -756,6 +793,28 @@ def _apply_translation(unit: ParagraphUnit, translated: str, *, verbose: bool = 
             first.set(XML_SPACE_ATTR, "preserve")
         for extra in slot.nodes[1:]:
             extra.text = ""
+        # Ép font (nếu chỉ định) cho tất cả run thuộc slot này.
+        if force_font:
+            for node in slot.nodes:
+                parent_run = node.getparent()
+                if parent_run is not None:
+                    _force_run_font(parent_run, force_font)
+
+
+def _force_run_font(run: etree._Element, font_name: str) -> None:
+    """Đặt rPr/rFonts của 1 <w:r> dùng đúng font_name cho mọi script."""
+    rpr_tag = f"{{{W_NS}}}rPr"
+    rfonts_tag = f"{{{W_NS}}}rFonts"
+    rpr = run.find(rpr_tag)
+    if rpr is None:
+        rpr = etree.Element(rpr_tag)
+        run.insert(0, rpr)  # rPr phải là child đầu tiên của w:r
+    for rf in rpr.findall(rfonts_tag):
+        rpr.remove(rf)
+    rfonts = etree.Element(rfonts_tag)
+    for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+        rfonts.set(f"{{{W_NS}}}{attr}", font_name)
+    rpr.insert(0, rfonts)  # rFonts thường là child đầu trong rPr
 
 
 def _restore_edge_whitespace(*, source: str, translated: str) -> str:

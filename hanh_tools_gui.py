@@ -16,13 +16,13 @@ from lib.openai_translator import DryRunTranslator, OpenAITranslator
 from lib.translation_cache import TranslationCache, cache_file, open_cache_folder
 
 
-MODEL_CHOICES = ["gpt-5-nano", "gpt-4.1-nano", "gpt-4.1-mini"]
+MODEL_CHOICES = ["gpt-4.1-nano", "gpt-4.1-mini"]
 # Default fallback chain — khi model hiện tại fail marker liên tục thì đẩy lên model mạnh hơn.
 FALLBACK_CHAIN = {
-    "gpt-5-nano": ["gpt-4.1-mini"],
     "gpt-4.1-nano": ["gpt-4.1-mini"],
     "gpt-4.1-mini": [],
 }
+DEFAULT_OUTPUT_FONT = "Times New Roman"
 
 
 APP_TITLE = "Hạnh Tools"
@@ -50,7 +50,8 @@ class HanhToolsApp:
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.target_lang_var = tk.StringVar(value="Vietnamese")
-        self.model_var = tk.StringVar(value="gpt-5-nano")
+        self.model_var = tk.StringVar(value="gpt-4.1-nano")
+        self.output_font_var = tk.StringVar(value=DEFAULT_OUTPUT_FONT)
         self.dry_run_var = tk.BooleanVar(value=False)
         self.include_extras_var = tk.BooleanVar(value=False)
         self.use_cache_var = tk.BooleanVar(value=True)
@@ -102,9 +103,15 @@ class HanhToolsApp:
         ttk.Combobox(frm, textvariable=self.model_var, values=MODEL_CHOICES,
                      state="readonly").grid(row=3, column=3, sticky="we", **pad)
 
+        # --- Hàng 4b: font đầu ra ---
+        ttk.Label(frm, text="Font đầu ra:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.output_font_var).grid(row=4, column=1, sticky="we", **pad)
+        ttk.Label(frm, text="(rỗng = giữ font gốc)",
+                  foreground="#777").grid(row=4, column=2, columnspan=2, sticky="w", **pad)
+
         # --- Hàng 5: tham số nâng cao (4 ô) ---
         params = ttk.LabelFrame(frm, text="Tham số nâng cao")
-        params.grid(row=4, column=0, columnspan=5, sticky="we", **pad)
+        params.grid(row=5, column=0, columnspan=5, sticky="we", **pad)
         for i in range(8):
             params.columnconfigure(i, weight=1)
         ttk.Label(params, text="Batch:").grid(row=0, column=0, sticky="e", **pad)
@@ -118,7 +125,7 @@ class HanhToolsApp:
 
         # --- Hàng 6: tuỳ chọn (checkboxes) ---
         flags = ttk.Frame(frm)
-        flags.grid(row=5, column=0, columnspan=5, sticky="we", **pad)
+        flags.grid(row=6, column=0, columnspan=5, sticky="we", **pad)
         ttk.Checkbutton(flags, text="Dùng cache",
                         variable=self.use_cache_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(flags, text="Lưu key vào .env",
@@ -130,7 +137,7 @@ class HanhToolsApp:
 
         # --- Hàng 7: nút action ---
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=5, sticky="we", **pad)
+        btns.grid(row=7, column=0, columnspan=5, sticky="we", **pad)
         self.run_btn = ttk.Button(btns, text="Bắt đầu dịch", command=self._on_run)
         self.run_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.stop_btn = ttk.Button(btns, text="Dừng", command=self._on_stop, state="disabled")
@@ -141,9 +148,9 @@ class HanhToolsApp:
                    command=self._clear_cache).pack(side=tk.LEFT)
 
         # --- Hàng 8: log ---
-        ttk.Label(frm, text="Log:").grid(row=7, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Log:").grid(row=8, column=0, sticky="w", **pad)
         log_frame = ttk.Frame(frm)
-        log_frame.grid(row=8, column=0, columnspan=5, sticky="nsew", **pad)
+        log_frame.grid(row=9, column=0, columnspan=5, sticky="nsew", **pad)
         self.log_text = tk.Text(log_frame, height=16, wrap="word", state="disabled")
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
@@ -152,7 +159,7 @@ class HanhToolsApp:
 
         for col in (1, 2, 3):
             frm.columnconfigure(col, weight=1)
-        frm.rowconfigure(8, weight=1)
+        frm.rowconfigure(9, weight=1)
 
     def _toggle_key_visibility(self) -> None:
         self.api_key_entry.config(show="" if self.show_key_var.get() else "*")
@@ -244,9 +251,10 @@ class HanhToolsApp:
         self._worker = threading.Thread(
             target=self._run_pipeline,
             args=(input_path, output_path, self.target_lang_var.get().strip() or "Vietnamese",
-                  self.model_var.get().strip() or "gpt-5-nano", dry_run,
+                  self.model_var.get().strip() or "gpt-4.1-nano", dry_run,
                   self.include_extras_var.get(), batch_size, max_tokens, concurrency,
-                  token_budget, self.use_cache_var.get()),
+                  token_budget, self.use_cache_var.get(),
+                  self.output_font_var.get().strip()),
             daemon=True,
         )
         self._worker.start()
@@ -271,7 +279,8 @@ class HanhToolsApp:
 
     def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str,
                       dry_run: bool, include_extras: bool, batch_size: int, max_tokens: int,
-                      concurrency: int, token_budget: int, use_cache: bool) -> None:
+                      concurrency: int, token_budget: int, use_cache: bool,
+                      output_font: str) -> None:
         stream = _StreamToQueue(self._log_queue)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = stream
@@ -290,7 +299,8 @@ class HanhToolsApp:
             print(f"Output: {out_p}")
             print(f"Target language: {target_lang} | Model: {model} | Dry-run: {dry_run}")
             print(f"Batch size: {batch_size} | Max output tokens: {max_tokens} | Concurrency: {concurrency} | Token budget: {token_budget}")
-            print(f"Include extras: {include_extras} | Cache: {'on' if use_cache else 'off'}")
+            print(f"Include extras: {include_extras} | Cache: {'on' if use_cache else 'off'} | "
+                  f"Output font: {output_font or '(giữ font gốc)'}")
 
             docx_path = self._prepare_docx(in_p, converted_dir)
 
@@ -329,6 +339,7 @@ class HanhToolsApp:
                 cache=cache,
                 target_language=target_lang,
                 input_token_budget=token_budget,
+                force_font=output_font or None,
             )
             cache.save()
             final_docx = zip_docx(work_dir, out_p, verbose=True)
