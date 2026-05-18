@@ -24,8 +24,8 @@ SYSTEM_PROMPT = (
     "3) Do not output anything between 〈/n〉 and the next 〈m〉.\n"
     "4) Do not translate URLs, emails, field codes, placeholders, or symbols.\n"
     "5) Return the same ids as input. No commentary.\n"
-    "Example input:  [{\"id\":\"x\",\"text\":\"〈0〉Hello 〈/0〉〈1〉world〈/1〉\"}]\n"
-    "Example output: {\"translations\":[{\"id\":\"x\",\"translation\":\"〈0〉Xin chào 〈/0〉〈1〉thế giới〈/1〉\"}]}"
+    "Example input:  [{\"id\":\"0\",\"text\":\"〈0〉Hello 〈/0〉〈1〉world〈/1〉\"}]\n"
+    "Example output: {\"translations\":[{\"id\":\"0\",\"translation\":\"〈0〉Xin chào 〈/0〉〈1〉thế giới〈/1〉\"}]}"
 )
 
 
@@ -67,12 +67,15 @@ class OpenAITranslator:
         except KeyError:
             self.encoding = tiktoken.get_encoding("o200k_base")
 
-    def estimate_output_tokens(self, items: list[dict[str, str]]) -> int:
-        """Ước lượng số token đầu ra cho 1 batch (đã tính overhead)."""
+    def estimate_input_tokens(self, items: list[dict[str, str]]) -> int:
         if not items:
             return 0
         text = "".join(item.get("text", "") for item in items)
-        input_tokens = len(self.encoding.encode(text))
+        return len(self.encoding.encode(text))
+
+    def estimate_output_tokens(self, items: list[dict[str, str]]) -> int:
+        """Ước lượng số token đầu ra cho 1 batch (đã tính overhead)."""
+        input_tokens = self.estimate_input_tokens(items)
         return int(input_tokens * OUTPUT_TOKEN_MULTIPLIER) + OUTPUT_TOKEN_OVERHEAD
 
     def is_batch_too_large(self, items: list[dict[str, str]]) -> bool:
@@ -81,6 +84,10 @@ class OpenAITranslator:
     def translate_batch(self, items: list[dict[str, str]]) -> dict[str, str]:
         if not items:
             return {}
+
+        # Compact ID: thay id dài bằng integer "0","1",... để tiết kiệm token.
+        compact_items = [{"id": str(i), "text": it["text"]} for i, it in enumerate(items)]
+        int_to_id = {str(i): it["id"] for i, it in enumerate(items)}
 
         try:
             response = self.client.chat.completions.create(
@@ -94,7 +101,7 @@ class OpenAITranslator:
                         "content": json.dumps(
                             {
                                 "target_language": self.target_language,
-                                "input": items,
+                                "input": compact_items,
                             },
                             ensure_ascii=False,
                         ),
@@ -136,7 +143,14 @@ class OpenAITranslator:
                 continue
             item_id = row.get("id")
             text = row.get("translation")
-            if isinstance(item_id, str) and isinstance(text, str):
-                translations[item_id] = text
+            if not isinstance(text, str):
+                continue
+            # Map compact id (int hoặc string số) ngược lại id gốc.
+            if isinstance(item_id, int):
+                item_id = str(item_id)
+            if isinstance(item_id, str):
+                original = int_to_id.get(item_id)
+                if original is not None:
+                    translations[original] = text
 
         return translations

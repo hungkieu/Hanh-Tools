@@ -10,6 +10,7 @@ from typing import Callable
 from lxml import etree
 
 from lib.openai_translator import BatchTooLargeError, Translator
+from lib.translation_cache import TranslationCache
 
 
 class CancelledError(Exception):
@@ -74,6 +75,8 @@ class TranslationStats:
     paragraphs_skipped: int = 0
     paragraphs_failed: int = 0
     paragraphs_fallback: int = 0  # marker fail, dùng fallback distribute vào slot 0
+    cache_hits: int = 0
+    cache_misses: int = 0
 
 
 @dataclass
@@ -105,6 +108,10 @@ def translate_docx_xml_folder(
     cancel_check: Callable[[], bool] = _noop_cancel,
     include_extras: bool = False,
     concurrency: int = 1,
+    fallback_translators: list[Translator] | None = None,
+    cache: TranslationCache | None = None,
+    target_language: str = "Vietnamese",
+    input_token_budget: int = 2000,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
@@ -125,12 +132,18 @@ def translate_docx_xml_folder(
             min_batch_size=min_batch_size,
             cancel_check=cancel_check,
             concurrency=concurrency,
+            fallback_translators=fallback_translators or [],
+            cache=cache,
+            target_language=target_language,
+            input_token_budget=input_token_budget,
         )
         stats.paragraphs_found += file_stats.paragraphs_found
         stats.paragraphs_translated += file_stats.paragraphs_translated
         stats.paragraphs_skipped += file_stats.paragraphs_skipped
         stats.paragraphs_failed += file_stats.paragraphs_failed
         stats.paragraphs_fallback += file_stats.paragraphs_fallback
+        stats.cache_hits += file_stats.cache_hits
+        stats.cache_misses += file_stats.cache_misses
 
     return stats
 
@@ -146,6 +159,10 @@ def _translate_xml_file(
     min_batch_size: int,
     cancel_check: Callable[[], bool] = _noop_cancel,
     concurrency: int = 1,
+    fallback_translators: list[Translator] | None = None,
+    cache: TranslationCache | None = None,
+    target_language: str = "Vietnamese",
+    input_token_budget: int = 2000,
 ) -> TranslationStats:
     parser = etree.XMLParser(remove_blank_text=False, recover=False)
     tree = etree.parse(str(xml_path), parser)
@@ -184,8 +201,40 @@ def _translate_xml_file(
             flush=True,
         )
 
+    # Cache lookup: tách thành (cached, to_translate)
     changed = False
-    batches = _chunks(dedup_units, batch_size)
+    cache_hits_units: list[ParagraphUnit] = []
+    to_translate: list[ParagraphUnit] = []
+    model_name = getattr(translator, "model", "unknown")
+    if cache is not None:
+        for unit in dedup_units:
+            cached = cache.get(model_name, target_language, unit.text)
+            if cached is not None and _validate_markers(cached, len(unit.slots)) is None:
+                cache_hits_units.append(unit)
+                # Apply ngay
+                for u in duplicate_groups[unit.id]:
+                    _apply_translation(u, cached, verbose=False)
+                    stats.paragraphs_translated += 1
+                stats.cache_hits += 1
+                changed = True
+            else:
+                to_translate.append(unit)
+        stats.cache_misses += len(to_translate)
+        if verbose and cache_hits_units:
+            print(
+                f"Cache: {len(cache_hits_units)} hit / {len(dedup_units)} unique "
+                f"(saved {len(cache_hits_units)} API calls)",
+                flush=True,
+            )
+    else:
+        to_translate = dedup_units
+
+    # Token-budget batching: pack đến khi đạt ngân sách input tokens.
+    batches = _token_aware_chunks(
+        to_translate, translator,
+        input_token_budget=input_token_budget,
+        hard_cap=batch_size,
+    )
 
     def _log_batch_start(batch_index: int, batch: list[ParagraphUnit]) -> None:
         if not verbose:
@@ -207,6 +256,7 @@ def _translate_xml_file(
             min_batch_size=min_batch_size,
             verbose=verbose,
             label=f"{xml_path.relative_to(root)} batch {batch_index}",
+            fallback_translators=fallback_translators or [],
         )
 
     def _apply_batch(batch: list[ParagraphUnit], translations: dict[str, tuple[str, bool]]) -> None:
@@ -224,6 +274,10 @@ def _translate_xml_file(
                 if used_fallback:
                     stats.paragraphs_fallback += 1
             changed = True
+            # Ghi cache (chỉ khi không phải fallback distribute, để không "đầu độc" cache)
+            if cache is not None and not used_fallback:
+                plain_len = len(_strip_markers(rep_unit.text).strip())
+                cache.put(model_name, target_language, rep_unit.text, translated, plain_len)
 
     def _check_cancel() -> None:
         if cancel_check():
@@ -282,6 +336,7 @@ def _translate_units_with_split_retry(
     min_batch_size: int,
     verbose: bool,
     label: str,
+    fallback_translators: list[Translator] | None = None,
 ) -> dict[str, tuple[str, bool]]:
     if not units:
         return {}
@@ -302,10 +357,12 @@ def _translate_units_with_split_retry(
             left = _translate_units_with_split_retry(
                 units[:midpoint], translator=translator, retries=retries,
                 min_batch_size=min_batch_size, verbose=verbose, label=f"{label}.1",
+                fallback_translators=fallback_translators,
             )
             right = _translate_units_with_split_retry(
                 units[midpoint:], translator=translator, retries=retries,
                 min_batch_size=min_batch_size, verbose=verbose, label=f"{label}.2",
+                fallback_translators=fallback_translators,
             )
             return left | right
 
@@ -316,6 +373,7 @@ def _translate_units_with_split_retry(
             retries=retries,
             verbose=verbose,
             label=label,
+            fallback_translators=fallback_translators or [],
         )
     except (TimeoutError, BatchTooLargeError) as exc:
         cause = "timeout" if isinstance(exc, TimeoutError) else "output too large"
@@ -341,6 +399,7 @@ def _translate_units_with_split_retry(
             min_batch_size=min_batch_size,
             verbose=verbose,
             label=f"{label}.1",
+            fallback_translators=fallback_translators,
         )
         right = _translate_units_with_split_retry(
             units[midpoint:],
@@ -349,6 +408,7 @@ def _translate_units_with_split_retry(
             min_batch_size=min_batch_size,
             verbose=verbose,
             label=f"{label}.2",
+            fallback_translators=fallback_translators,
         )
         return left | right
 
@@ -376,11 +436,16 @@ def _translate_units_with_marker_retry(
     retries: int,
     verbose: bool,
     label: str,
+    fallback_translators: list[Translator] | None = None,
 ) -> dict[str, tuple[str, bool]]:
     pending = units
     # value = (translated_text, used_fallback)
     translations: dict[str, tuple[str, bool]] = {}
     last_raw: dict[str, str] = {}
+    # Chain: primary trước, rồi tới các model fallback.
+    translator_chain = [translator] + list(fallback_translators or [])
+    current_translator = translator_chain[0]
+    translator_idx = 0
     for attempt in range(retries + 1):
         if verbose and attempt > 0:
             print(
@@ -389,7 +454,7 @@ def _translate_units_with_marker_retry(
                 flush=True,
             )
 
-        raw = translator.translate_batch(
+        raw = current_translator.translate_batch(
             [{"id": unit.id, "text": unit.text} for unit in pending]
         )
         failed: list[ParagraphUnit] = []
@@ -426,6 +491,18 @@ def _translate_units_with_marker_retry(
         if not failed:
             break
         pending = failed
+        # Còn fail và còn model mạnh hơn → escalate (đẩy lên model cao hơn).
+        if attempt < retries and translator_idx + 1 < len(translator_chain):
+            translator_idx += 1
+            current_translator = translator_chain[translator_idx]
+            if verbose:
+                next_model = getattr(current_translator, "model", str(current_translator))
+                print(
+                    f"  Escalating to stronger model '{next_model}' for {len(pending)} "
+                    f"paragraph(s) in {label}",
+                    flush=True,
+                )
+            continue
         if attempt == retries:
             # Hết retry — thử fallback distribute cho từng unit còn fail.
             recovered: list[str] = []
@@ -718,3 +795,36 @@ def _sanitize_xml_text(text: str) -> str:
 
 def _chunks(items: list[ParagraphUnit], size: int) -> list[list[ParagraphUnit]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _token_aware_chunks(
+    units: list[ParagraphUnit],
+    translator: Translator,
+    *,
+    input_token_budget: int,
+    hard_cap: int,
+) -> list[list[ParagraphUnit]]:
+    """Đóng batch theo ngân sách input tokens; mỗi batch tối đa hard_cap paragraphs."""
+    estimate = getattr(translator, "estimate_input_tokens", None)
+    if estimate is None:
+        # Translator không hỗ trợ đếm token (vd DryRunTranslator) — fallback cố định.
+        return _chunks(units, hard_cap)
+
+    batches: list[list[ParagraphUnit]] = []
+    current: list[ParagraphUnit] = []
+    current_tokens = 0
+    for unit in units:
+        unit_tokens = estimate([{"id": unit.id, "text": unit.text}])
+        # Nếu thêm 1 paragraph nữa vượt budget hoặc cap, đóng batch.
+        if current and (
+            current_tokens + unit_tokens > input_token_budget
+            or len(current) >= hard_cap
+        ):
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(unit)
+        current_tokens += unit_tokens
+    if current:
+        batches.append(current)
+    return batches
