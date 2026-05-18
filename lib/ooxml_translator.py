@@ -8,7 +8,7 @@ from typing import Callable
 
 from lxml import etree
 
-from lib.openai_translator import Translator
+from lib.openai_translator import BatchTooLargeError, Translator
 
 
 class CancelledError(Exception):
@@ -23,8 +23,8 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 NS = {"w": W_NS}
 XML_SPACE_ATTR = f"{{{XML_NS}}}space"
-CONTENT_XML_PATTERNS = (
-    "word/document.xml",
+DEFAULT_CONTENT_XML_PATTERNS = ("word/document.xml",)
+EXTRA_CONTENT_XML_PATTERNS = (
     "word/header*.xml",
     "word/footer*.xml",
     "word/footnotes.xml",
@@ -73,13 +73,14 @@ def translate_docx_xml_folder(
     verbose: bool = False,
     min_batch_size: int = 1,
     cancel_check: Callable[[], bool] = _noop_cancel,
+    include_extras: bool = False,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Không tìm thấy folder docx đã unzip: {root}")
 
     stats = TranslationStats()
-    for xml_path in _iter_content_xml_files(root):
+    for xml_path in _iter_content_xml_files(root, include_extras=include_extras):
         if cancel_check():
             raise CancelledError("Đã dừng bởi người dùng")
         stats.files_scanned += 1
@@ -190,6 +191,29 @@ def _translate_units_with_split_retry(
     if not units:
         return {}
 
+    # Pre-emptive split: nếu ước lượng output vượt max_completion_tokens → chia đôi trước.
+    is_too_large = getattr(translator, "is_batch_too_large", None)
+    if is_too_large is not None and len(units) > min_batch_size:
+        items = [{"id": u.id, "text": u.text} for u in units]
+        if is_too_large(items):
+            midpoint = max(1, len(units) // 2)
+            if verbose:
+                est = getattr(translator, "estimate_output_tokens", lambda _: 0)(items)
+                print(
+                    f"Pre-emptive split (est {est} output tokens > limit) {label}: "
+                    f"{len(units)} -> {midpoint} + {len(units) - midpoint}",
+                    flush=True,
+                )
+            left = _translate_units_with_split_retry(
+                units[:midpoint], translator=translator, retries=retries,
+                min_batch_size=min_batch_size, verbose=verbose, label=f"{label}.1",
+            )
+            right = _translate_units_with_split_retry(
+                units[midpoint:], translator=translator, retries=retries,
+                min_batch_size=min_batch_size, verbose=verbose, label=f"{label}.2",
+            )
+            return left | right
+
     try:
         return _translate_units_with_marker_retry(
             units,
@@ -198,17 +222,18 @@ def _translate_units_with_split_retry(
             verbose=verbose,
             label=label,
         )
-    except TimeoutError:
+    except (TimeoutError, BatchTooLargeError) as exc:
+        cause = "timeout" if isinstance(exc, TimeoutError) else "output too large"
         if len(units) <= min_batch_size:
             if verbose:
-                print(f"OpenAI timeout, skipped smallest batch: {label}", flush=True)
+                print(f"OpenAI {cause}, skipped smallest batch: {label}", flush=True)
             return {}
 
         midpoint = len(units) // 2
         if verbose:
             char_count = sum(len(unit.text) for unit in units)
             print(
-                f"OpenAI timeout, splitting {label}: "
+                f"OpenAI {cause}, splitting {label}: "
                 f"{len(units)} paragraphs / {char_count} chars -> "
                 f"{midpoint} + {len(units) - midpoint}",
                 flush=True,
@@ -292,9 +317,12 @@ def _translate_units_with_marker_retry(
     return translations
 
 
-def _iter_content_xml_files(root: Path) -> list[Path]:
+def _iter_content_xml_files(root: Path, *, include_extras: bool = False) -> list[Path]:
+    patterns = list(DEFAULT_CONTENT_XML_PATTERNS)
+    if include_extras:
+        patterns.extend(EXTRA_CONTENT_XML_PATTERNS)
     files: list[Path] = []
-    for pattern in CONTENT_XML_PATTERNS:
+    for pattern in patterns:
         files.extend(root.glob(pattern))
     return sorted(path for path in files if path.is_file())
 

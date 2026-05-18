@@ -41,6 +41,9 @@ class HanhToolsApp:
         self.target_lang_var = tk.StringVar(value="Vietnamese")
         self.model_var = tk.StringVar(value="gpt-4.1-nano")
         self.dry_run_var = tk.BooleanVar(value=False)
+        self.include_extras_var = tk.BooleanVar(value=False)
+        self.batch_size_var = tk.StringVar(value="5")
+        self.max_tokens_var = tk.StringVar(value="8192")
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)
         self.save_env_var = tk.BooleanVar(value=True)
@@ -84,8 +87,14 @@ class HanhToolsApp:
         ttk.Label(opts, text="Ngôn ngữ đích:").pack(side=tk.LEFT)
         ttk.Entry(opts, textvariable=self.target_lang_var, width=18).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(opts, text="Model:").pack(side=tk.LEFT)
-        ttk.Entry(opts, textvariable=self.model_var, width=20).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Entry(opts, textvariable=self.model_var, width=18).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(opts, text="Batch:").pack(side=tk.LEFT)
+        ttk.Entry(opts, textvariable=self.batch_size_var, width=4).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(opts, text="Max output tokens:").pack(side=tk.LEFT)
+        ttk.Entry(opts, textvariable=self.max_tokens_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Checkbutton(opts, text="Lưu key vào .env", variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(opts, text="Dịch cả header/footer/footnote/comment",
+                        variable=self.include_extras_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(opts, text="Dry run (không gọi API)", variable=self.dry_run_var).pack(side=tk.LEFT)
 
         btns = ttk.Frame(frm)
@@ -164,6 +173,12 @@ class HanhToolsApp:
         if not dry_run and not api_key:
             messagebox.showwarning(APP_TITLE, "Vui lòng nhập OPENAI_API_KEY (hoặc bật Dry run).")
             return
+        try:
+            batch_size = max(1, int(self.batch_size_var.get().strip()))
+            max_tokens = max(512, int(self.max_tokens_var.get().strip()))
+        except ValueError:
+            messagebox.showwarning(APP_TITLE, "Batch size và Max output tokens phải là số nguyên.")
+            return
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
             if self.save_env_var.get():
@@ -172,7 +187,8 @@ class HanhToolsApp:
         self._worker = threading.Thread(
             target=self._run_pipeline,
             args=(input_path, output_path, self.target_lang_var.get().strip() or "Vietnamese",
-                  self.model_var.get().strip() or "gpt-4.1-nano", dry_run),
+                  self.model_var.get().strip() or "gpt-4.1-nano", dry_run,
+                  self.include_extras_var.get(), batch_size, max_tokens),
             daemon=True,
         )
         self._worker.start()
@@ -195,7 +211,8 @@ class HanhToolsApp:
         lines.append(f"OPENAI_API_KEY={api_key}")
         env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str, dry_run: bool) -> None:
+    def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str,
+                      dry_run: bool, include_extras: bool, batch_size: int, max_tokens: int) -> None:
         stream = _StreamToQueue(self._log_queue)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = stream
@@ -213,6 +230,7 @@ class HanhToolsApp:
             print(f"Input: {in_p}")
             print(f"Output: {out_p}")
             print(f"Target language: {target_lang} | Model: {model} | Dry-run: {dry_run}")
+            print(f"Batch size: {batch_size} | Max output tokens: {max_tokens} | Include extras: {include_extras}")
 
             docx_path = self._prepare_docx(in_p, converted_dir)
 
@@ -229,13 +247,14 @@ class HanhToolsApp:
                     source_language="auto",
                     target_language=target_lang,
                     timeout=180,
-                    max_completion_tokens=4096,
+                    max_completion_tokens=max_tokens,
                 )
             )
             stats = translate_docx_xml_folder(
                 work_dir, translator,
-                batch_size=5, retries=2, verbose=True, min_batch_size=1,
+                batch_size=batch_size, retries=2, verbose=True, min_batch_size=1,
                 cancel_check=self._cancel_event.is_set,
+                include_extras=include_extras,
             )
             final_docx = zip_docx(work_dir, out_p, verbose=True)
 

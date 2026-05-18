@@ -49,6 +49,7 @@ def main() -> None:
         retries=args.retries,
         verbose=args.verbose,
         min_batch_size=args.min_batch_size,
+        include_extras=args.include_extras,
     )
     final_docx = zip_docx(work_dir, output_path, verbose=args.verbose)
 
@@ -73,14 +74,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="gpt-4.1-nano")
     parser.add_argument("--source-language", default="auto")
     parser.add_argument("--target-language", default="Vietnamese")
-    parser.add_argument("--batch-size", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--min-batch-size", type=int, default=1)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--openai-timeout", type=float, default=180)
-    parser.add_argument("--max-completion-tokens", type=int, default=4096)
+    parser.add_argument("--max-completion-tokens", type=int, default=8192)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--dry-run-prefix", default="")
+    parser.add_argument(
+        "--include-extras",
+        action="store_true",
+        help="Dịch thêm header/footer/footnote/endnote/comment (mặc định chỉ document.xml).",
+    )
     return parser.parse_args()
 
 
