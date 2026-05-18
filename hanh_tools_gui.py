@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from lib.doc_converter import convert_doc_to_docx
 from lib.docx_package import unzip_docx, zip_docx
-from lib.ooxml_translator import translate_docx_xml_folder
+from lib.ooxml_translator import CancelledError, translate_docx_xml_folder
 from lib.openai_translator import DryRunTranslator, OpenAITranslator
 
 
@@ -53,6 +53,7 @@ class HanhToolsApp:
 
         self._log_queue: "queue.Queue[str]" = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._cancel_event = threading.Event()
 
         self._build_ui()
         self._poll_log_queue()
@@ -87,8 +88,12 @@ class HanhToolsApp:
         ttk.Checkbutton(opts, text="Lưu key vào .env", variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(opts, text="Dry run (không gọi API)", variable=self.dry_run_var).pack(side=tk.LEFT)
 
-        self.run_btn = ttk.Button(frm, text="Bắt đầu dịch", command=self._on_run)
-        self.run_btn.grid(row=4, column=0, columnspan=3, **pad)
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, **pad)
+        self.run_btn = ttk.Button(btns, text="Bắt đầu dịch", command=self._on_run)
+        self.run_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.stop_btn = ttk.Button(btns, text="Dừng", command=self._on_stop, state="disabled")
+        self.stop_btn.pack(side=tk.LEFT)
 
         ttk.Label(frm, text="Log:").grid(row=5, column=0, sticky="w", **pad)
         self.log_text = tk.Text(frm, height=18, wrap="word", state="disabled")
@@ -147,7 +152,9 @@ class HanhToolsApp:
         if self._worker and self._worker.is_alive():
             return
 
+        self._cancel_event.clear()
         self.run_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
@@ -169,6 +176,13 @@ class HanhToolsApp:
             daemon=True,
         )
         self._worker.start()
+
+    def _on_stop(self) -> None:
+        if not self._worker or not self._worker.is_alive():
+            return
+        self._cancel_event.set()
+        self.stop_btn.config(state="disabled")
+        self._log_queue.put("\n>>> Đang yêu cầu dừng... (sẽ dừng sau khi batch hiện tại xong)\n")
 
     def _save_env_file(self, api_key: str) -> None:
         env_path = Path(os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
@@ -221,6 +235,7 @@ class HanhToolsApp:
             stats = translate_docx_xml_folder(
                 work_dir, translator,
                 batch_size=5, retries=2, verbose=True, min_batch_size=1,
+                cancel_check=self._cancel_event.is_set,
             )
             final_docx = zip_docx(work_dir, out_p, verbose=True)
 
@@ -232,11 +247,16 @@ class HanhToolsApp:
             print(f"- Paragraphs translated: {stats.paragraphs_translated}")
             print(f"- Paragraphs skipped: {stats.paragraphs_skipped}")
             print(f"- Paragraphs failed: {stats.paragraphs_failed}")
+        except CancelledError:
+            print("\n>>> Đã dừng theo yêu cầu. File output có thể chưa hoàn chỉnh.")
         except Exception as e:
             print(f"\n[LỖI] {e}")
         finally:
             sys.stdout, sys.stderr = old_out, old_err
-            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+            def _reset_buttons() -> None:
+                self.run_btn.config(state="normal")
+                self.stop_btn.config(state="disabled")
+            self.root.after(0, _reset_buttons)
 
     def _prepare_docx(self, input_path: Path, converted_dir: Path) -> Path:
         if not input_path.exists():

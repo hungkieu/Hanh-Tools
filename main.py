@@ -73,7 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="gpt-4.1-nano")
     parser.add_argument("--source-language", default="auto")
     parser.add_argument("--target-language", default="Vietnamese")
-    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--min-batch-size", type=int, default=1)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--openai-timeout", type=float, default=180)

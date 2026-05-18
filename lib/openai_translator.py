@@ -53,7 +53,10 @@ class OpenAITranslator:
                         "content": (
                             "You translate document text while preserving formatting markers. "
                             "Return only valid JSON. Preserve every marker exactly, including "
-                            "markers like [[[0]]] and [[[/0]]]. Do not add commentary."
+                            "markers like [[[0]]] and [[[/0]]]. Do not add commentary. "
+                            "Whitespace inside markers is significant — never trim, add, or "
+                            "collapse it. Never insert text between [[[/n]]] and the next "
+                            "[[[m]]] marker."
                         ),
                     },
                     {
@@ -65,10 +68,21 @@ class OpenAITranslator:
                                 "target_language": self.target_language,
                                 "rules": [
                                     "Translate natural-language text only.",
-                                    "Keep all markers exactly unchanged.",
-                                    "Return the same ids.",
+                                    "Keep all markers exactly unchanged (same count, same ids, same order).",
+                                    "Return the same ids in the JSON output.",
                                     "Do not translate URLs, emails, field codes, or placeholders.",
+                                    "Preserve whitespace at the boundaries of each marker exactly. "
+                                    "If source slot starts/ends with a space, the translated slot must too.",
+                                    "Do not output anything between a closing marker [[[/n]]] and the "
+                                    "next opening marker [[[m]]] — they must be adjacent.",
+                                    "If a slot contains only whitespace or punctuation, copy it verbatim.",
                                 ],
+                                "example": {
+                                    "input": [{"id": "x", "text": "[[[0]]]Hello [[[/0]]][[[1]]]world[[[/1]]]"}],
+                                    "output": {"translations": [
+                                        {"id": "x", "translation": "[[[0]]]Xin chào [[[/0]]][[[1]]]thế giới[[[/1]]]"}
+                                    ]},
+                                },
                                 "input": items,
                                 "output_schema": {
                                     "translations": [

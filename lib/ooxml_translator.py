@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from lxml import etree
 
 from lib.openai_translator import Translator
 
 
+class CancelledError(Exception):
+    """Người dùng đã yêu cầu dừng."""
+
+
+def _noop_cancel() -> bool:
+    return False
+
+
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
 NS = {"w": W_NS}
+XML_SPACE_ATTR = f"{{{XML_NS}}}space"
 CONTENT_XML_PATTERNS = (
     "word/document.xml",
     "word/header*.xml",
@@ -20,7 +32,6 @@ CONTENT_XML_PATTERNS = (
     "word/comments.xml",
 )
 MARKER_RE = re.compile(r"\[\[\[(\d+)]]]([\s\S]*?)\[\[\[/\1]]]")
-WORD_RE = re.compile(r"[A-Za-zÀ-ỹ]")
 INVALID_XML_CHAR_RE = re.compile(
     "[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]"
 )
@@ -37,9 +48,13 @@ class TranslationStats:
 
 @dataclass
 class TextSlot:
-    node: etree._Element
+    nodes: list[etree._Element]
     index: int
     text: str
+
+    @property
+    def node(self) -> etree._Element:
+        return self.nodes[0]
 
 
 @dataclass
@@ -57,6 +72,7 @@ def translate_docx_xml_folder(
     retries: int = 2,
     verbose: bool = False,
     min_batch_size: int = 1,
+    cancel_check: Callable[[], bool] = _noop_cancel,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
@@ -64,6 +80,8 @@ def translate_docx_xml_folder(
 
     stats = TranslationStats()
     for xml_path in _iter_content_xml_files(root):
+        if cancel_check():
+            raise CancelledError("Đã dừng bởi người dùng")
         stats.files_scanned += 1
         file_stats = _translate_xml_file(
             xml_path,
@@ -73,6 +91,7 @@ def translate_docx_xml_folder(
             retries=retries,
             verbose=verbose,
             min_batch_size=min_batch_size,
+            cancel_check=cancel_check,
         )
         stats.paragraphs_found += file_stats.paragraphs_found
         stats.paragraphs_translated += file_stats.paragraphs_translated
@@ -91,18 +110,33 @@ def _translate_xml_file(
     retries: int,
     verbose: bool,
     min_batch_size: int,
+    cancel_check: Callable[[], bool] = _noop_cancel,
 ) -> TranslationStats:
     parser = etree.XMLParser(remove_blank_text=False, recover=False)
     tree = etree.parse(str(xml_path), parser)
     units = _extract_paragraph_units(tree, xml_path.relative_to(root).as_posix())
     stats = TranslationStats(paragraphs_found=len(units))
 
-    translatable = [unit for unit in units if _should_translate(unit.text)]
-    stats.paragraphs_skipped += len(units) - len(translatable)
+    translatable: list[ParagraphUnit] = []
+    for unit in units:
+        reason = _skip_reason(unit.text)
+        if reason is None:
+            translatable.append(unit)
+        else:
+            stats.paragraphs_skipped += 1
+            if verbose:
+                plain = MARKER_RE.sub(lambda m: m.group(2), unit.text)
+                print(f"  [SKIP {reason}] {unit.id} text={_truncate(plain, 80)!r}", flush=True)
 
     changed = False
     batches = _chunks(translatable, batch_size)
     for batch_index, batch in enumerate(batches, start=1):
+        if cancel_check():
+            if changed:
+                if verbose:
+                    print(f"Cancelled; writing partial translation: {xml_path.relative_to(root)}", flush=True)
+                tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True, standalone=None)
+            raise CancelledError("Đã dừng bởi người dùng")
         if verbose:
             char_count = sum(len(unit.text) for unit in batch)
             marker_count = sum(len(unit.slots) for unit in batch)
@@ -225,21 +259,33 @@ def _translate_units_with_marker_retry(
             translated = raw.get(unit.id)
             if translated is None:
                 failed.append(unit)
+                if verbose:
+                    print(
+                        f"  [FAIL no-response] {unit.id} "
+                        f"src={_truncate(unit.text)}",
+                        flush=True,
+                    )
                 continue
-            if _translation_matches_slots(translated, len(unit.slots)):
+            reason = _validate_markers(translated, len(unit.slots))
+            if reason is None:
                 translations[unit.id] = translated
             else:
                 failed.append(unit)
+                if verbose:
+                    print(
+                        f"  [FAIL {reason}] {unit.id}\n"
+                        f"    src: {_truncate(unit.text)}\n"
+                        f"    out: {_truncate(translated)}",
+                        flush=True,
+                    )
 
         if not failed:
             break
         pending = failed
         if attempt == retries and verbose:
-            failed_ids = ", ".join(unit.id for unit in failed[:5])
-            suffix = "..." if len(failed) > 5 else ""
             print(
-                f"Skipped paragraphs after marker validation failed: "
-                f"{len(failed)} ({failed_ids}{suffix})",
+                f"Skipped {len(failed)} paragraphs after {retries + 1} attempts: "
+                f"{', '.join(unit.id for unit in failed)}",
                 flush=True,
             )
 
@@ -256,57 +302,185 @@ def _iter_content_xml_files(root: Path) -> list[Path]:
 def _extract_paragraph_units(tree: etree._ElementTree, file_id: str) -> list[ParagraphUnit]:
     units: list[ParagraphUnit] = []
     for paragraph_index, paragraph in enumerate(tree.xpath("//w:p", namespaces=NS)):
-        slots: list[TextSlot] = []
-        parts: list[str] = []
-        for text_index, text_node in enumerate(paragraph.xpath(".//w:t", namespaces=NS)):
-            text = text_node.text or ""
-            if text == "":
-                continue
-            slot = TextSlot(node=text_node, index=len(slots), text=text)
-            slots.append(slot)
-            parts.append(f"[[[{slot.index}]]]{text}[[[/{slot.index}]]]")
-
-        if slots:
-            units.append(
-                ParagraphUnit(
-                    id=f"{file_id}:p:{paragraph_index}",
-                    text="".join(parts),
-                    slots=slots,
-                )
+        raw_slots = _collect_text_nodes(paragraph)
+        slots = _merge_adjacent_slots(raw_slots)
+        if not slots:
+            continue
+        parts = [f"[[[{slot.index}]]]{slot.text}[[[/{slot.index}]]]" for slot in slots]
+        units.append(
+            ParagraphUnit(
+                id=f"{file_id}:p:{paragraph_index}",
+                text="".join(parts),
+                slots=slots,
             )
-
+        )
     return units
 
 
+def _collect_text_nodes(paragraph: etree._Element) -> list[tuple[etree._Element, etree._Element]]:
+    """Trả về [(run, w:t)] giữ nguyên thứ tự xuất hiện trong paragraph."""
+    pairs: list[tuple[etree._Element, etree._Element]] = []
+    for run in paragraph.iter(f"{{{W_NS}}}r"):
+        for text_node in run.findall(f"{{{W_NS}}}t"):
+            if (text_node.text or "") != "":
+                pairs.append((run, text_node))
+    return pairs
+
+
+def _merge_adjacent_slots(
+    pairs: list[tuple[etree._Element, etree._Element]],
+) -> list[TextSlot]:
+    """Gộp các w:t liền kề có cùng run-property (bỏ qua hint=eastAsia)."""
+    slots: list[TextSlot] = []
+    current_nodes: list[etree._Element] = []
+    current_text: list[str] = []
+    current_key: str | None = None
+    prev_run: etree._Element | None = None
+
+    def _flush() -> None:
+        if current_nodes:
+            slots.append(TextSlot(
+                nodes=list(current_nodes),
+                index=len(slots),
+                text="".join(current_text),
+            ))
+
+    for run, text_node in pairs:
+        key = _run_format_key(run)
+        adjacent = (
+            prev_run is not None
+            and key == current_key
+            and _runs_are_adjacent_siblings(prev_run, run)
+        )
+        if not adjacent:
+            _flush()
+            current_nodes = []
+            current_text = []
+            current_key = key
+        current_nodes.append(text_node)
+        current_text.append(text_node.text or "")
+        prev_run = run
+    _flush()
+    return slots
+
+
+def _run_format_key(run: etree._Element) -> str:
+    rpr = run.find(f"{{{W_NS}}}rPr")
+    if rpr is None:
+        return ""
+    clone = etree.fromstring(etree.tostring(rpr))
+    # Bỏ <w:rFonts> chỉ chứa hint (không thay đổi hình thức)
+    for rfonts in list(clone.findall(f"{{{W_NS}}}rFonts")):
+        attrs = {k for k in rfonts.attrib.keys() if k != f"{{{XML_NS}}}space"}
+        if attrs == {f"{{{W_NS}}}hint"} or not attrs:
+            clone.remove(rfonts)
+    # rPr rỗng sau khi normalize ≡ không có rPr
+    if len(clone) == 0 and not clone.attrib:
+        return ""
+    return etree.tostring(clone, method="c14n").decode("utf-8")
+
+
+def _runs_are_adjacent_siblings(a: etree._Element, b: etree._Element) -> bool:
+    """True nếu giữa 2 run không có element nào khác (bookmark, field, ...)."""
+    sibling = a.getnext()
+    return sibling is b
+
+
 def _should_translate(text: str) -> bool:
+    return _skip_reason(text) is None
+
+
+def _skip_reason(text: str) -> str | None:
+    """None nếu nên dịch, ngược lại trả về lý do skip để log."""
     plain = MARKER_RE.sub(lambda match: match.group(2), text).strip()
     if not plain:
-        return False
-    if not WORD_RE.search(plain):
-        return False
+        return "empty"
+    if not _has_letter(plain):
+        return "no letters"
     if plain.startswith("http://") or plain.startswith("https://"):
-        return False
-    return True
+        return "url"
+    return None
+
+
+def _has_letter(text: str) -> bool:
+    """True nếu có ít nhất 1 ký tự thuộc category Unicode 'Letter' (L*)."""
+    return any(unicodedata.category(ch).startswith("L") for ch in text)
 
 
 def _translation_matches_slots(text: str, slot_count: int) -> bool:
+    return _validate_markers(text, slot_count) is None
+
+
+def _validate_markers(text: str, slot_count: int) -> str | None:
+    """Trả về None nếu hợp lệ, hoặc chuỗi mô tả lỗi để debug."""
     matches = list(MARKER_RE.finditer(text))
     if len(matches) != slot_count:
-        return False
-    return [int(match.group(1)) for match in matches] == list(range(slot_count))
+        return (
+            f"marker count mismatch: expected {slot_count}, got {len(matches)}"
+        )
+    ids = [int(match.group(1)) for match in matches]
+    if ids != list(range(slot_count)):
+        return f"marker ids out of order: expected {list(range(slot_count))}, got {ids}"
+    return None
+
+
+def _truncate(text: str, limit: int = 200) -> str:
+    text = text.replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... (+{len(text) - limit} chars)"
 
 
 def _apply_translation(unit: ParagraphUnit, translated: str, *, verbose: bool = False) -> None:
     matches = list(MARKER_RE.finditer(translated))
     for slot, match in zip(unit.slots, matches, strict=True):
-        text = _sanitize_xml_text(match.group(2))
-        if verbose and text != match.group(2):
+        raw = match.group(2)
+        text = _sanitize_xml_text(raw)
+        text = _restore_edge_whitespace(source=slot.text, translated=text)
+        if verbose and text != raw:
             print(
-                f"Removed XML-incompatible control characters from {unit.id} "
-                f"slot {slot.index}",
+                f"Adjusted text for {unit.id} slot {slot.index} "
+                f"(sanitized/edge-whitespace restored)",
                 flush=True,
             )
-        slot.node.text = text
+        # Ghi toàn bộ text dịch vào node đầu, xoá text các node còn lại của slot
+        first = slot.nodes[0]
+        first.text = text
+        if _needs_preserve_space(text):
+            first.set(XML_SPACE_ATTR, "preserve")
+        for extra in slot.nodes[1:]:
+            extra.text = ""
+
+
+def _restore_edge_whitespace(*, source: str, translated: str) -> str:
+    """Nếu model lỡ trim space đầu/cuối slot mà nguồn có, phục hồi để tránh dính chữ."""
+    if not translated:
+        return translated
+    leading = _leading_space(source)
+    if leading and not translated[0].isspace():
+        translated = leading + translated
+    trailing = _trailing_space(source)
+    if trailing and not translated[-1].isspace():
+        translated = translated + trailing
+    return translated
+
+
+def _leading_space(text: str) -> str:
+    i = 0
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return text[:i]
+
+
+def _trailing_space(text: str) -> str:
+    i = len(text)
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    return text[i:]
+
+
+def _needs_preserve_space(text: str) -> bool:
+    return bool(text) and (text[0].isspace() or text[-1].isspace())
 
 
 def _sanitize_xml_text(text: str) -> str:
