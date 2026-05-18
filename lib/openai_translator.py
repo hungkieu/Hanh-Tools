@@ -15,6 +15,20 @@ OUTPUT_TOKEN_MULTIPLIER = 2.2
 OUTPUT_TOKEN_OVERHEAD = 200
 
 
+SYSTEM_PROMPT = (
+    "You translate document text into the target language while preserving formatting markers.\n"
+    "Output strictly valid JSON: {\"translations\":[{\"id\":...,\"translation\":...}]}\n"
+    "Rules:\n"
+    "1) Keep every marker 〈n〉...〈/n〉 byte-for-byte (do NOT use ASCII <n>; do NOT add whitespace inside).\n"
+    "2) Whitespace at marker boundaries is significant — do not trim/add/collapse it.\n"
+    "3) Do not output anything between 〈/n〉 and the next 〈m〉.\n"
+    "4) Do not translate URLs, emails, field codes, placeholders, or symbols.\n"
+    "5) Return the same ids as input. No commentary.\n"
+    "Example input:  [{\"id\":\"x\",\"text\":\"〈0〉Hello 〈/0〉〈1〉world〈/1〉\"}]\n"
+    "Example output: {\"translations\":[{\"id\":\"x\",\"translation\":\"〈0〉Xin chào 〈/0〉〈1〉thế giới〈/1〉\"}]}"
+)
+
+
 class BatchTooLargeError(Exception):
     """Output bị cắt hoặc JSON hỏng — caller nên chia nhỏ batch và retry."""
 
@@ -74,50 +88,13 @@ class OpenAITranslator:
                 response_format={"type": "json_object"},
                 max_completion_tokens=self.max_completion_tokens,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You translate document text while preserving formatting markers. "
-                            "Return only valid JSON. Preserve every marker exactly, including "
-                            "markers like [[[0]]] and [[[/0]]]. Do not add commentary. "
-                            "Whitespace inside markers is significant — never trim, add, or "
-                            "collapse it. Never insert text between [[[/n]]] and the next "
-                            "[[[m]]] marker."
-                        ),
-                    },
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": json.dumps(
                             {
-                                "task": "translate",
-                                "source_language": self.source_language,
                                 "target_language": self.target_language,
-                                "rules": [
-                                    "Translate natural-language text only.",
-                                    "Keep all markers exactly unchanged (same count, same ids, same order).",
-                                    "Return the same ids in the JSON output.",
-                                    "Do not translate URLs, emails, field codes, or placeholders.",
-                                    "Preserve whitespace at the boundaries of each marker exactly. "
-                                    "If source slot starts/ends with a space, the translated slot must too.",
-                                    "Do not output anything between a closing marker [[[/n]]] and the "
-                                    "next opening marker [[[m]]] — they must be adjacent.",
-                                    "If a slot contains only whitespace or punctuation, copy it verbatim.",
-                                ],
-                                "example": {
-                                    "input": [{"id": "x", "text": "[[[0]]]Hello [[[/0]]][[[1]]]world[[[/1]]]"}],
-                                    "output": {"translations": [
-                                        {"id": "x", "translation": "[[[0]]]Xin chào [[[/0]]][[[1]]]thế giới[[[/1]]]"}
-                                    ]},
-                                },
                                 "input": items,
-                                "output_schema": {
-                                    "translations": [
-                                        {
-                                            "id": "same id as input",
-                                            "translation": "translated text",
-                                        }
-                                    ]
-                                },
                             },
                             ensure_ascii=False,
                         ),

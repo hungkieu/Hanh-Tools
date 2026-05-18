@@ -42,7 +42,7 @@ class HanhToolsApp:
         self.model_var = tk.StringVar(value="gpt-4.1-nano")
         self.dry_run_var = tk.BooleanVar(value=False)
         self.include_extras_var = tk.BooleanVar(value=False)
-        self.batch_size_var = tk.StringVar(value="5")
+        self.batch_size_var = tk.StringVar(value="20")
         self.max_tokens_var = tk.StringVar(value="8192")
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)

@@ -31,7 +31,35 @@ EXTRA_CONTENT_XML_PATTERNS = (
     "word/endnotes.xml",
     "word/comments.xml",
 )
-MARKER_RE = re.compile(r"\[\[\[(\d+)]]]([\s\S]*?)\[\[\[/\1]]]")
+# Marker ngắn để tiết kiệm token. Dùng angle bracket toán học (U+2329/U+232A),
+# rất hiếm khi xuất hiện trong text thường.
+MARKER_RE = re.compile(r"〈(\d+)〉([\s\S]*?)〈/\1〉")
+
+# Lenient pattern dùng để "sửa" marker mà model viết hơi lệch (thừa space, thiếu /).
+_MARKER_REPAIR_OPEN_RE = re.compile(r"〈\s*(\d+)\s*〉")
+_MARKER_REPAIR_CLOSE_RE = re.compile(r"〈\s*/\s*(\d+)\s*〉")
+# Bắt cả trường hợp model dùng nhầm bracket ASCII < > vì model hay "phiên dịch"
+# angle bracket toán học sang HTML-like.
+_MARKER_REPAIR_OPEN_ASCII_RE = re.compile(r"<\s*(\d+)\s*>")
+_MARKER_REPAIR_CLOSE_ASCII_RE = re.compile(r"<\s*/\s*(\d+)\s*>")
+
+
+def _repair_markers(text: str) -> str:
+    """Sửa các marker bị viết lệch nhẹ (whitespace, ASCII <> thay vì 〈〉)."""
+    # Close trước để dấu / không bị nuốt bởi pattern open.
+    text = _MARKER_REPAIR_CLOSE_RE.sub(lambda m: f"〈/{m.group(1)}〉", text)
+    text = _MARKER_REPAIR_OPEN_RE.sub(lambda m: f"〈{m.group(1)}〉", text)
+    text = _MARKER_REPAIR_CLOSE_ASCII_RE.sub(lambda m: f"〈/{m.group(1)}〉", text)
+    text = _MARKER_REPAIR_OPEN_ASCII_RE.sub(lambda m: f"〈{m.group(1)}〉", text)
+    return text
+
+
+def _open_marker(idx: int) -> str:
+    return f"〈{idx}〉"
+
+
+def _close_marker(idx: int) -> str:
+    return f"〈/{idx}〉"
 INVALID_XML_CHAR_RE = re.compile(
     "[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]"
 )
@@ -129,8 +157,29 @@ def _translate_xml_file(
                 plain = MARKER_RE.sub(lambda m: m.group(2), unit.text)
                 print(f"  [SKIP {reason}] {unit.id} text={_truncate(plain, 80)!r}", flush=True)
 
+    # Dedupe: nhiều paragraph trong file có thể có text giống nhau (header bảng,
+    # ghi chú lặp). Chỉ gửi unique text lên API, áp dụng kết quả cho mọi bản sao.
+    unique_units: dict[str, ParagraphUnit] = {}
+    duplicate_groups: dict[str, list[ParagraphUnit]] = {}
+    for unit in translatable:
+        if unit.text not in unique_units:
+            unique_units[unit.text] = unit
+            duplicate_groups[unit.id] = [unit]
+        else:
+            rep_id = unique_units[unit.text].id
+            duplicate_groups[rep_id].append(unit)
+
+    dedup_units = list(unique_units.values())
+    dedup_savings = len(translatable) - len(dedup_units)
+    if verbose and dedup_savings > 0:
+        print(
+            f"Dedup: {len(translatable)} translatable -> {len(dedup_units)} unique "
+            f"(saved {dedup_savings} API translations)",
+            flush=True,
+        )
+
     changed = False
-    batches = _chunks(translatable, batch_size)
+    batches = _chunks(dedup_units, batch_size)
     for batch_index, batch in enumerate(batches, start=1):
         if cancel_check():
             if changed:
@@ -155,15 +204,16 @@ def _translate_xml_file(
             verbose=verbose,
             label=f"{xml_path.relative_to(root)} batch {batch_index}",
         )
-        failed_count = len(batch) - len(translations)
-        stats.paragraphs_failed += failed_count
-
-        for unit in batch:
-            translated = translations.get(unit.id)
+        # Mỗi unique unit fail = mọi paragraph dùng text đó fail.
+        for rep_unit in batch:
+            group = duplicate_groups[rep_unit.id]
+            translated = translations.get(rep_unit.id)
             if not translated:
+                stats.paragraphs_failed += len(group)
                 continue
-            _apply_translation(unit, translated, verbose=verbose)
-            stats.paragraphs_translated += 1
+            for unit in group:
+                _apply_translation(unit, translated, verbose=verbose)
+                stats.paragraphs_translated += 1
             changed = True
 
     if changed:
@@ -282,6 +332,11 @@ def _translate_units_with_marker_retry(
         failed: list[ParagraphUnit] = []
         for unit in pending:
             translated = raw.get(unit.id)
+            if translated is not None:
+                repaired = _repair_markers(translated)
+                if repaired != translated and verbose:
+                    print(f"  [REPAIRED markers] {unit.id}", flush=True)
+                translated = repaired
             if translated is None:
                 failed.append(unit)
                 if verbose:
@@ -330,11 +385,22 @@ def _iter_content_xml_files(root: Path, *, include_extras: bool = False) -> list
 def _extract_paragraph_units(tree: etree._ElementTree, file_id: str) -> list[ParagraphUnit]:
     units: list[ParagraphUnit] = []
     for paragraph_index, paragraph in enumerate(tree.xpath("//w:p", namespaces=NS)):
-        raw_slots = _collect_text_nodes(paragraph)
-        slots = _merge_adjacent_slots(raw_slots)
+        pairs = _collect_text_nodes(paragraph)
+        if not pairs:
+            continue
+        # Paragraph "đơn giản" (không hình ảnh, không field, không math) + cùng format
+        # → gộp tất cả về 1 slot, tiết kiệm rất nhiều marker.
+        if _is_simple_paragraph(paragraph) and _all_runs_same_format(pairs):
+            slots = [TextSlot(
+                nodes=[t for _, t in pairs],
+                index=0,
+                text="".join((t.text or "") for _, t in pairs),
+            )]
+        else:
+            slots = _merge_adjacent_slots(pairs)
         if not slots:
             continue
-        parts = [f"[[[{slot.index}]]]{slot.text}[[[/{slot.index}]]]" for slot in slots]
+        parts = [f"{_open_marker(s.index)}{s.text}{_close_marker(s.index)}" for s in slots]
         units.append(
             ParagraphUnit(
                 id=f"{file_id}:p:{paragraph_index}",
@@ -345,13 +411,63 @@ def _extract_paragraph_units(tree: etree._ElementTree, file_id: str) -> list[Par
     return units
 
 
+# Các tag block aggressive-merge (giữ format chi tiết để không phá layout).
+_COMPLEX_PARAGRAPH_TAGS = frozenset({
+    f"{{{W_NS}}}drawing",
+    f"{{{W_NS}}}pict",
+    f"{{{W_NS}}}object",
+    f"{{{W_NS}}}fldChar",
+    f"{{{W_NS}}}instrText",
+    f"{{{W_NS}}}oMath",
+    f"{{{W_NS}}}oMathPara",
+})
+
+
+def _is_simple_paragraph(paragraph: etree._Element) -> bool:
+    """Không tính descendant nằm trong <w:p> lồng (text box, ...)."""
+    p_tag = f"{{{W_NS}}}p"
+
+    def _walk(el: etree._Element) -> bool:
+        for child in el:
+            if child.tag == p_tag:
+                continue
+            if child.tag in _COMPLEX_PARAGRAPH_TAGS:
+                return False
+            if not _walk(child):
+                return False
+        return True
+
+    return _walk(paragraph)
+
+
+def _all_runs_same_format(pairs: list[tuple[etree._Element, etree._Element]]) -> bool:
+    if len(pairs) <= 1:
+        return True
+    first_key = _run_format_key(pairs[0][0])
+    return all(_run_format_key(run) == first_key for run, _ in pairs)
+
+
 def _collect_text_nodes(paragraph: etree._Element) -> list[tuple[etree._Element, etree._Element]]:
-    """Trả về [(run, w:t)] giữ nguyên thứ tự xuất hiện trong paragraph."""
+    """Trả về [(run, w:t)] thuộc về paragraph này, KHÔNG đi vào các <w:p> lồng bên trong
+    (text box, alternate content, ...) — chúng được liệt kê và dịch riêng."""
     pairs: list[tuple[etree._Element, etree._Element]] = []
-    for run in paragraph.iter(f"{{{W_NS}}}r"):
-        for text_node in run.findall(f"{{{W_NS}}}t"):
-            if (text_node.text or "") != "":
-                pairs.append((run, text_node))
+    p_tag = f"{{{W_NS}}}p"
+    r_tag = f"{{{W_NS}}}r"
+    t_tag = f"{{{W_NS}}}t"
+
+    def _walk(element: etree._Element) -> None:
+        for child in element:
+            if child.tag == p_tag:
+                continue  # paragraph lồng — xử lý ở vòng //w:p ngoài
+            if child.tag == r_tag:
+                for text_node in child.findall(t_tag):
+                    if (text_node.text or "") != "":
+                        pairs.append((child, text_node))
+                _walk(child)
+            else:
+                _walk(child)
+
+    _walk(paragraph)
     return pairs
 
 
