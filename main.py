@@ -32,6 +32,7 @@ def main() -> None:
         shutil.rmtree(work_dir)
     unzip_docx(docx_path, work_dir, verbose=args.verbose)
 
+    only_english = not args.translate_all_scripts
     if args.dry_run:
         translator = DryRunTranslator(prefix=args.dry_run_prefix)
         fallback_translators: list = []
@@ -42,6 +43,7 @@ def main() -> None:
             target_language=args.target_language,
             timeout=args.openai_timeout,
             max_completion_tokens=args.max_completion_tokens,
+            only_english=only_english,
         )
         fallback_translators = [
             OpenAITranslator(
@@ -50,6 +52,7 @@ def main() -> None:
                 target_language=args.target_language,
                 timeout=args.openai_timeout,
                 max_completion_tokens=args.max_completion_tokens,
+                only_english=only_english,
             )
             for m in args.fallback_models
         ]
@@ -69,6 +72,7 @@ def main() -> None:
         target_language=args.target_language,
         input_token_budget=args.input_token_budget,
         force_font=args.force_font or None,
+        only_english=only_english,
     )
     cache.save()
     final_docx = zip_docx(work_dir, output_path, verbose=args.verbose)
@@ -117,6 +121,12 @@ def _parse_args() -> argparse.Namespace:
         "--include-extras",
         action="store_true",
         help="Dịch thêm header/footer/footnote/endnote/comment (mặc định chỉ document.xml).",
+    )
+    parser.add_argument(
+        "--translate-all-scripts",
+        action="store_true",
+        help="Dịch cả đoạn không có tiếng Anh (mặc định: chỉ dịch tiếng Anh, "
+             "skip đoạn thuần Trung/Nhật/Hàn và giữ nguyên phần non-English trong đoạn lai).",
     )
     return parser.parse_args()
 

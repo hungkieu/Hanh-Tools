@@ -55,6 +55,7 @@ class HanhToolsApp:
         self.dry_run_var = tk.BooleanVar(value=False)
         self.include_extras_var = tk.BooleanVar(value=False)
         self.use_cache_var = tk.BooleanVar(value=True)
+        self.only_english_var = tk.BooleanVar(value=True)
         self.batch_size_var = tk.StringVar(value="20")
         self.max_tokens_var = tk.StringVar(value="8192")
         self.concurrency_var = tk.StringVar(value="3")
@@ -132,6 +133,8 @@ class HanhToolsApp:
                         variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(flags, text="Dịch cả header/footer/footnote/comment",
                         variable=self.include_extras_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(flags, text="Chỉ dịch tiếng Anh (skip đoạn thuần Trung/Nhật/Hàn)",
+                        variable=self.only_english_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(flags, text="Dry run (không gọi API)",
                         variable=self.dry_run_var).pack(side=tk.LEFT)
 
@@ -254,7 +257,8 @@ class HanhToolsApp:
                   self.model_var.get().strip() or "gpt-4.1-nano", dry_run,
                   self.include_extras_var.get(), batch_size, max_tokens, concurrency,
                   token_budget, self.use_cache_var.get(),
-                  self.output_font_var.get().strip()),
+                  self.output_font_var.get().strip(),
+                  self.only_english_var.get()),
             daemon=True,
         )
         self._worker.start()
@@ -280,7 +284,7 @@ class HanhToolsApp:
     def _run_pipeline(self, input_path: str, output_path: str, target_lang: str, model: str,
                       dry_run: bool, include_extras: bool, batch_size: int, max_tokens: int,
                       concurrency: int, token_budget: int, use_cache: bool,
-                      output_font: str) -> None:
+                      output_font: str, only_english: bool = True) -> None:
         stream = _StreamToQueue(self._log_queue)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = stream
@@ -316,11 +320,13 @@ class HanhToolsApp:
                 translator = OpenAITranslator(
                     model=model, source_language="auto", target_language=target_lang,
                     timeout=180, max_completion_tokens=max_tokens,
+                    only_english=only_english,
                 )
                 fallback_translators = [
                     OpenAITranslator(
                         model=m, source_language="auto", target_language=target_lang,
                         timeout=180, max_completion_tokens=max_tokens,
+                        only_english=only_english,
                     )
                     for m in FALLBACK_CHAIN.get(model, [])
                 ]
@@ -340,6 +346,7 @@ class HanhToolsApp:
                 target_language=target_lang,
                 input_token_budget=token_budget,
                 force_font=output_font or None,
+                only_english=only_english,
             )
             cache.save()
             final_docx = zip_docx(work_dir, out_p, verbose=True)

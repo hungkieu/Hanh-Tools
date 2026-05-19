@@ -28,6 +28,14 @@ SYSTEM_PROMPT = (
     "Example output: {\"translations\":[{\"id\":\"0\",\"translation\":\"〈0〉Xin chào 〈/0〉〈1〉thế giới〈/1〉\"}]}"
 )
 
+ENGLISH_ONLY_RULE = (
+    "\n6) Translate ONLY English text. Keep any non-English text "
+    "(Chinese, Japanese, Korean, etc.) byte-for-byte as-is in the output — "
+    "do not translate or transliterate it.\n"
+    "Example input:  [{\"id\":\"0\",\"text\":\"〈0〉Chapter 1 第一章〈/0〉\"}]\n"
+    "Example output: {\"translations\":[{\"id\":\"0\",\"translation\":\"〈0〉Chương 1 第一章〈/0〉\"}]}"
+)
+
 
 class BatchTooLargeError(Exception):
     """Output bị cắt hoặc JSON hỏng — caller nên chia nhỏ batch và retry."""
@@ -55,6 +63,7 @@ class OpenAITranslator:
         target_language: str = "Vietnamese",
         timeout: float = 60,
         max_completion_tokens: int = 8192,
+        only_english: bool = True,
     ) -> None:
         self.client = OpenAI(timeout=timeout)
         self.model = model or os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-nano")
@@ -62,6 +71,8 @@ class OpenAITranslator:
         self.target_language = target_language
         self.timeout = timeout
         self.max_completion_tokens = max_completion_tokens
+        self.only_english = only_english
+        self.system_prompt = SYSTEM_PROMPT + (ENGLISH_ONLY_RULE if only_english else "")
         try:
             self.encoding = tiktoken.encoding_for_model(self.model)
         except KeyError:
@@ -95,7 +106,7 @@ class OpenAITranslator:
                 response_format={"type": "json_object"},
                 max_completion_tokens=self.max_completion_tokens,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.system_prompt},
                     {
                         "role": "user",
                         "content": json.dumps(

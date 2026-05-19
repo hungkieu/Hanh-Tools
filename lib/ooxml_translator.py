@@ -144,6 +144,7 @@ def translate_docx_xml_folder(
     target_language: str = "Vietnamese",
     input_token_budget: int = 2000,
     force_font: str | None = None,
+    only_english: bool = True,
 ) -> TranslationStats:
     root = Path(docx_folder).expanduser().resolve()
     if not root.exists():
@@ -169,6 +170,7 @@ def translate_docx_xml_folder(
             target_language=target_language,
             input_token_budget=input_token_budget,
             force_font=force_font,
+            only_english=only_english,
         )
         stats.paragraphs_found += file_stats.paragraphs_found
         stats.paragraphs_translated += file_stats.paragraphs_translated
@@ -197,6 +199,7 @@ def _translate_xml_file(
     target_language: str = "Vietnamese",
     input_token_budget: int = 2000,
     force_font: str | None = None,
+    only_english: bool = True,
 ) -> TranslationStats:
     parser = etree.XMLParser(remove_blank_text=False, recover=False)
     tree = etree.parse(str(xml_path), parser)
@@ -205,7 +208,7 @@ def _translate_xml_file(
 
     translatable: list[ParagraphUnit] = []
     for unit in units:
-        reason = _skip_reason(unit.text)
+        reason = _skip_reason(unit.text, only_latin=only_english)
         if reason is None:
             translatable.append(unit)
         else:
@@ -240,9 +243,11 @@ def _translate_xml_file(
     cache_hits_units: list[ParagraphUnit] = []
     to_translate: list[ParagraphUnit] = []
     model_name = getattr(translator, "model", "unknown")
+    # Mode khác nhau (only_english on/off) cho output khác nhau với đoạn lai → tách bucket.
+    cache_lang_key = f"{target_language}|en-only" if only_english else target_language
     if cache is not None:
         for unit in dedup_units:
-            cached = cache.get(model_name, target_language, unit.text)
+            cached = cache.get(model_name, cache_lang_key, unit.text)
             if cached is not None and _validate_markers(cached, len(unit.slots)) is None:
                 cache_hits_units.append(unit)
                 # Apply ngay
@@ -311,7 +316,7 @@ def _translate_xml_file(
             # Ghi cache (chỉ khi không phải fallback distribute, để không "đầu độc" cache)
             if cache is not None and not used_fallback:
                 plain_len = len(_strip_markers(rep_unit.text).strip())
-                cache.put(model_name, target_language, rep_unit.text, translated, plain_len)
+                cache.put(model_name, cache_lang_key, rep_unit.text, translated, plain_len)
 
     def _check_cancel() -> None:
         if cancel_check():
@@ -730,8 +735,12 @@ def _should_translate(text: str) -> bool:
     return _skip_reason(text) is None
 
 
-def _skip_reason(text: str) -> str | None:
-    """None nếu nên dịch, ngược lại trả về lý do skip để log."""
+def _skip_reason(text: str, *, only_latin: bool = True) -> str | None:
+    """None nếu nên dịch, ngược lại trả về lý do skip để log.
+
+    only_latin=True: bỏ qua đoạn không chứa ký tự Latin (A-Za-z) — dùng để skip
+    đoạn thuần Trung/Nhật/Hàn khi user chỉ muốn dịch tiếng Anh.
+    """
     plain = MARKER_RE.sub(lambda match: match.group(2), text).strip()
     if not plain:
         return "empty"
@@ -739,12 +748,18 @@ def _skip_reason(text: str) -> str | None:
         return "no letters"
     if plain.startswith("http://") or plain.startswith("https://"):
         return "url"
+    if only_latin and not _has_latin_letter(plain):
+        return "no latin"
     return None
 
 
 def _has_letter(text: str) -> bool:
     """True nếu có ít nhất 1 ký tự thuộc category Unicode 'Letter' (L*)."""
     return any(unicodedata.category(ch).startswith("L") for ch in text)
+
+
+def _has_latin_letter(text: str) -> bool:
+    return any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in text)
 
 
 def _translation_matches_slots(text: str, slot_count: int) -> bool:
