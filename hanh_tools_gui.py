@@ -44,11 +44,14 @@ class HanhToolsApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("820x680")
-        self.root.minsize(720, 580)
+        self.root.geometry("820x560")
+        self.root.minsize(720, 460)
 
-        self.input_var = tk.StringVar()
-        self.output_var = tk.StringVar()
+        cwd = Path.cwd()
+        self.default_input_dir = cwd / "docx"
+        self.default_output_dir = cwd / "translated"
+        self.input_var = tk.StringVar(value=str(self.default_input_dir))
+        self.output_var = tk.StringVar(value=str(self.default_output_dir))
         self.target_lang_var = tk.StringVar(value="Vietnamese")
         self.model_var = tk.StringVar(value="gpt-4.1-nano")
         self.output_font_var = tk.StringVar(value=DEFAULT_OUTPUT_FONT)
@@ -82,7 +85,7 @@ class HanhToolsApp:
         frm = ttk.Frame(self.root)
         frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # --- Hàng 1-3: input / output / API key ---
+        # --- Hàng 0-1: input / output ---
         ttk.Label(frm, text="File input (.doc / .docx):").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.input_var).grid(row=0, column=1, columnspan=3, sticky="we", **pad)
         ttk.Button(frm, text="Chọn...", command=self._pick_input).grid(row=0, column=4, **pad)
@@ -91,28 +94,9 @@ class HanhToolsApp:
         ttk.Entry(frm, textvariable=self.output_var).grid(row=1, column=1, columnspan=3, sticky="we", **pad)
         ttk.Button(frm, text="Chọn...", command=self._pick_output).grid(row=1, column=4, **pad)
 
-        ttk.Label(frm, text="OPENAI_API_KEY:").grid(row=2, column=0, sticky="w", **pad)
-        self.api_key_entry = ttk.Entry(frm, textvariable=self.api_key_var, show="*")
-        self.api_key_entry.grid(row=2, column=1, columnspan=3, sticky="we", **pad)
-        ttk.Checkbutton(frm, text="Hiện", variable=self.show_key_var,
-                        command=self._toggle_key_visibility).grid(row=2, column=4, sticky="w", **pad)
-
-        # --- Hàng 4: dịch & model ---
-        ttk.Label(frm, text="Ngôn ngữ đích:").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.target_lang_var).grid(row=3, column=1, sticky="we", **pad)
-        ttk.Label(frm, text="Model:").grid(row=3, column=2, sticky="e", **pad)
-        ttk.Combobox(frm, textvariable=self.model_var, values=MODEL_CHOICES,
-                     state="readonly").grid(row=3, column=3, sticky="we", **pad)
-
-        # --- Hàng 4b: font đầu ra ---
-        ttk.Label(frm, text="Font đầu ra:").grid(row=4, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.output_font_var).grid(row=4, column=1, sticky="we", **pad)
-        ttk.Label(frm, text="(rỗng = giữ font gốc)",
-                  foreground="#777").grid(row=4, column=2, columnspan=2, sticky="w", **pad)
-
-        # --- Hàng 5: tham số nâng cao (4 ô) ---
-        params = ttk.LabelFrame(frm, text="Tham số nâng cao")
-        params.grid(row=5, column=0, columnspan=5, sticky="we", **pad)
+        # --- Hàng 2: tham số ---
+        params = ttk.LabelFrame(frm, text="Tham số")
+        params.grid(row=2, column=0, columnspan=5, sticky="we", **pad)
         for i in range(8):
             params.columnconfigure(i, weight=1)
         ttk.Label(params, text="Batch:").grid(row=0, column=0, sticky="e", **pad)
@@ -124,36 +108,37 @@ class HanhToolsApp:
         ttk.Label(params, text="Input token budget:").grid(row=0, column=6, sticky="e", **pad)
         ttk.Entry(params, textvariable=self.token_budget_var, width=7).grid(row=0, column=7, sticky="w", **pad)
 
-        # --- Hàng 6: tuỳ chọn (checkboxes) ---
-        flags = ttk.Frame(frm)
-        flags.grid(row=6, column=0, columnspan=5, sticky="we", **pad)
-        ttk.Checkbutton(flags, text="Dùng cache",
-                        variable=self.use_cache_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(flags, text="Lưu key vào .env",
-                        variable=self.save_env_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(flags, text="Dịch cả header/footer/footnote/comment",
-                        variable=self.include_extras_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(flags, text="Chỉ dịch tiếng Anh (skip đoạn thuần Trung/Nhật/Hàn)",
-                        variable=self.only_english_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(flags, text="Dry run (không gọi API)",
-                        variable=self.dry_run_var).pack(side=tk.LEFT)
-
-        # --- Hàng 7: nút action ---
+        # --- Hàng 3: action row ---
         btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=5, sticky="we", **pad)
+        btns.grid(row=3, column=0, columnspan=5, sticky="we", **pad)
         self.run_btn = ttk.Button(btns, text="Bắt đầu dịch", command=self._on_run)
         self.run_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.stop_btn = ttk.Button(btns, text="Dừng", command=self._on_stop, state="disabled")
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 24))
-        ttk.Button(btns, text="Mở thư mục cache",
-                   command=self._open_cache_folder).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="Xoá cache",
-                   command=self._clear_cache).pack(side=tk.LEFT)
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 16))
 
-        # --- Hàng 8: log ---
-        ttk.Label(frm, text="Log:").grid(row=8, column=0, sticky="w", **pad)
+        # Menubutton "Tuỳ chọn" — dropdown với 4 checkbox
+        opts_mb = tk.Menubutton(btns, text="Tuỳ chọn ▾", relief="raised", padx=8, pady=2)
+        opts_menu = tk.Menu(opts_mb, tearoff=False)
+        opts_menu.add_checkbutton(label="Dùng cache", variable=self.use_cache_var)
+        opts_menu.add_checkbutton(label="Chỉ dịch tiếng Anh", variable=self.only_english_var)
+        opts_menu.add_checkbutton(label="Dịch cả header / footer / footnote / comment",
+                                  variable=self.include_extras_var)
+        opts_menu.add_separator()
+        opts_menu.add_checkbutton(label="Dry run (không gọi API)", variable=self.dry_run_var)
+        opts_mb.config(menu=opts_menu)
+        opts_mb.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(btns, text="⚙ Cài đặt nâng cao",
+                   command=self._open_settings).pack(side=tk.LEFT, padx=(0, 12))
+
+        # Progress bar bên phải, fill phần còn lại
+        self.progress = ttk.Progressbar(btns, mode="indeterminate")
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- Hàng 4: log ---
+        ttk.Label(frm, text="Log:").grid(row=4, column=0, sticky="w", **pad)
         log_frame = ttk.Frame(frm)
-        log_frame.grid(row=9, column=0, columnspan=5, sticky="nsew", **pad)
+        log_frame.grid(row=5, column=0, columnspan=5, sticky="nsew", **pad)
         self.log_text = tk.Text(log_frame, height=16, wrap="word", state="disabled")
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
@@ -162,7 +147,63 @@ class HanhToolsApp:
 
         for col in (1, 2, 3):
             frm.columnconfigure(col, weight=1)
-        frm.rowconfigure(9, weight=1)
+        frm.rowconfigure(5, weight=1)
+
+    def _open_settings(self) -> None:
+        if getattr(self, "_settings_win", None) and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Cài đặt nâng cao")
+        win.transient(self.root)
+        win.resizable(False, False)
+        self._settings_win = win
+        pad = {"padx": 10, "pady": 6}
+
+        # API key
+        api_frame = ttk.LabelFrame(win, text="OpenAI")
+        api_frame.grid(row=0, column=0, sticky="we", **pad)
+        api_frame.columnconfigure(1, weight=1)
+        ttk.Label(api_frame, text="API key:").grid(row=0, column=0, sticky="w", **pad)
+        self.api_key_entry = ttk.Entry(api_frame, textvariable=self.api_key_var,
+                                        show="*", width=50)
+        self.api_key_entry.grid(row=0, column=1, sticky="we", **pad)
+        key_flags = ttk.Frame(api_frame)
+        key_flags.grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(key_flags, text="Hiện", variable=self.show_key_var,
+                        command=self._toggle_key_visibility).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(key_flags, text="Lưu vào .env",
+                        variable=self.save_env_var).pack(side=tk.LEFT)
+
+        # Dịch
+        tr_frame = ttk.LabelFrame(win, text="Dịch")
+        tr_frame.grid(row=1, column=0, sticky="we", **pad)
+        tr_frame.columnconfigure(1, weight=1)
+        tr_frame.columnconfigure(3, weight=1)
+        ttk.Label(tr_frame, text="Ngôn ngữ đích:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(tr_frame, textvariable=self.target_lang_var,
+                  width=20).grid(row=0, column=1, sticky="we", **pad)
+        ttk.Label(tr_frame, text="Model:").grid(row=0, column=2, sticky="e", **pad)
+        ttk.Combobox(tr_frame, textvariable=self.model_var, values=MODEL_CHOICES,
+                     state="readonly", width=18).grid(row=0, column=3, sticky="we", **pad)
+        ttk.Label(tr_frame, text="Font đầu ra:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(tr_frame, textvariable=self.output_font_var,
+                  width=20).grid(row=1, column=1, sticky="we", **pad)
+        ttk.Label(tr_frame, text="(rỗng = giữ font gốc)",
+                  foreground="#777").grid(row=1, column=2, columnspan=2, sticky="w", **pad)
+
+        # Cache
+        cache_frame = ttk.LabelFrame(win, text="Cache")
+        cache_frame.grid(row=2, column=0, sticky="we", **pad)
+        ttk.Button(cache_frame, text="Mở thư mục cache",
+                   command=self._open_cache_folder).pack(side=tk.LEFT, padx=8, pady=8)
+        ttk.Button(cache_frame, text="Xoá cache",
+                   command=self._clear_cache).pack(side=tk.LEFT, padx=(0, 8), pady=8)
+
+        ttk.Button(win, text="Đóng", command=win.destroy).grid(row=3, column=0,
+                                                                sticky="e", **pad)
+        win.columnconfigure(0, weight=1)
 
     def _toggle_key_visibility(self) -> None:
         self.api_key_entry.config(show="" if self.show_key_var.get() else "*")
@@ -183,24 +224,49 @@ class HanhToolsApp:
             messagebox.showwarning(APP_TITLE, f"Lỗi xoá cache: {e}")
 
     def _pick_input(self) -> None:
+        initial_dir = self._existing_dir(self.input_var.get(), self.default_input_dir)
         path = filedialog.askopenfilename(
             title="Chọn file Word",
+            initialdir=str(initial_dir),
             filetypes=[("Word files", "*.doc *.docx"), ("All files", "*.*")],
         )
         if path:
             self.input_var.set(path)
-            if not self.output_var.get():
-                stem = Path(path).stem
-                self.output_var.set(str(Path(path).with_name(f"{stem}.vi.docx")))
+            stem = Path(path).stem
+            out_dir = self._existing_dir(self.output_var.get(), self.default_output_dir,
+                                          treat_as_dir=True)
+            self.output_var.set(str(out_dir / f"{stem}.vi.docx"))
 
     def _pick_output(self) -> None:
+        current = Path(self.output_var.get()) if self.output_var.get() else self.default_output_dir
+        initial_dir = self._existing_dir(str(current.parent if current.suffix else current),
+                                          self.default_output_dir, treat_as_dir=True)
+        initial_file = current.name if current.suffix else ""
         path = filedialog.asksaveasfilename(
             title="Lưu file dịch",
+            initialdir=str(initial_dir),
+            initialfile=initial_file,
             defaultextension=".docx",
             filetypes=[("Word docx", "*.docx")],
         )
         if path:
             self.output_var.set(path)
+
+    @staticmethod
+    def _existing_dir(candidate: str, fallback: Path, *, treat_as_dir: bool = False) -> Path:
+        """Trả về thư mục tồn tại gần nhất: nếu candidate là file thì lấy parent;
+        nếu không tồn tại thì leo cha; cuối cùng fallback rồi cwd."""
+        if candidate:
+            p = Path(candidate)
+            if not treat_as_dir and p.is_file():
+                p = p.parent
+            while p != p.parent:
+                if p.is_dir():
+                    return p
+                p = p.parent
+        if fallback.is_dir():
+            return fallback
+        return Path.cwd()
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
@@ -229,6 +295,7 @@ class HanhToolsApp:
         self._cancel_event.clear()
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.progress.start(12)
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
@@ -370,6 +437,7 @@ class HanhToolsApp:
             def _reset_buttons() -> None:
                 self.run_btn.config(state="normal")
                 self.stop_btn.config(state="disabled")
+                self.progress.stop()
             self.root.after(0, _reset_buttons)
 
     def _prepare_docx(self, input_path: Path, converted_dir: Path) -> Path:
